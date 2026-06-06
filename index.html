@@ -1016,6 +1016,15 @@
         </div>
         <div id="banksList" style="max-height: 150px; overflow-y: auto; font-size: 14px;"></div>
       </div>
+
+      <div class="section-card" style="padding: 15px; grid-column: span 2;">
+        <div class="section-header" style="font-size: 0.9em;"><i class="fas fa-key"></i> AI API Token (Hugging Face)</div>
+        <div style="display: flex; gap: 5px;">
+          <input type="password" id="apiTokenInput" placeholder="Enter your HF Token here" style="padding: 8px;">
+          <button class="action-btn primary" onclick="saveApiToken()" style="width: 100px;">Save</button>
+        </div>
+        <div style="font-size: 11px; margin-top: 5px; color: #777;">Your token is saved locally in your browser and never sent to GitHub.</div>
+      </div>
     </div>
     <div style="text-align: center; color: #777; font-size: 12px; margin-top: 10px;">
       <i class="fas fa-info-circle"></i> These options will update the dropdowns in your entry form.
@@ -1048,10 +1057,9 @@
 <script>
   // Centralized App Configuration
   const APP_NAME = "SpendWise";
-  // Set this to your local Ollama URL or a cloud proxy when hosting
   const AI_CONFIG = {
-    endpoint: 'http://localhost:11434/api/generate',
-    model: 'phi3'
+    endpoint: 'https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2',
+    get token() { return localStorage.getItem('spendwise_api_token') || ''; }
   };
 
   let budgetData = [];
@@ -1149,10 +1157,16 @@
 
   // Manage People and Banks Settings
   function getSettings() {
-    return {
+    const defaultSettings = {
       people: ['Harsha', 'Cherry'],
       banks: ['Scotia Debit', 'Scotia Credit', 'Amex', 'PC', 'Wealthsimple', 'Simplii']
     };
+    const stored = localStorage.getItem('spendwise_settings');
+    return stored ? JSON.parse(stored) : defaultSettings;
+  }
+
+  function saveSettings(settings) {
+    localStorage.setItem('spendwise_settings', JSON.stringify(settings));
   }
 
   function addSettingItem(key, inputId) {
@@ -1164,6 +1178,7 @@
     if (!settings[key].includes(val)) {
       settings[key].push(val);
       input.value = '';
+      saveSettings(settings);
       populateSettingsUI();
       updateDropdowns();
     }
@@ -1172,6 +1187,7 @@
   function removeSettingItem(key, index) {
     const settings = getSettings();
     settings[key].splice(index, 1);
+    saveSettings(settings);
     populateSettingsUI();
     updateDropdowns();
   }
@@ -1206,6 +1222,18 @@
     // Restore previous selection if still available
     if (settings.people.includes(pVal)) pSelect.value = pVal;
     if (settings.banks.includes(bVal)) bSelect.value = bVal;
+  }
+
+  function saveApiToken() {
+    const token = document.getElementById('apiTokenInput').value.trim();
+    if (token) {
+      localStorage.setItem('spendwise_api_token', token);
+      showStatus('🔑 API Token saved locally!');
+    }
+  }
+
+  function saveToLocalStorage() {
+    localStorage.setItem('spendwise_budget_data', JSON.stringify(budgetData));
   }
 
   function toggleTheme() {
@@ -1493,6 +1521,7 @@
       showStatus('✅ Entry added successfully!');
     }
 
+    saveToLocalStorage();
     renderTable();
     resetForm();
   }
@@ -1683,6 +1712,7 @@
   function removeRow(index) {
     if (confirm('🗑️ Are you sure you want to delete this entry?')) {
       budgetData.splice(index, 1);
+      saveToLocalStorage();
       if (editIndex === index) {
         editIndex = -1;
         addBtn.innerHTML = '<i class="fas fa-plus"></i>';
@@ -1699,6 +1729,7 @@
   function clearTable() {
     if (confirm('🗑️ Clear all data? This action cannot be undone.')) {
       budgetData = [];
+      saveToLocalStorage();
       editIndex = -1;
       addBtn.innerHTML = '<i class="fas fa-plus"></i>';
       addBtn.setAttribute('data-tooltip', 'Add Entry');
@@ -1751,6 +1782,7 @@
         }
         lastUploadData = jsonData;
         budgetData = jsonData;
+      saveToLocalStorage();
         renderTable();
         showStatus('✅ Excel file uploaded successfully!');
       } catch (error) {
@@ -2270,8 +2302,13 @@
   updateGreeting();
   updateDropdowns();
 
-  // Start with empty data as local storage is disabled
-  budgetData = [];
+  // Load Data and Config
+  const storedData = localStorage.getItem('spendwise_budget_data');
+  if (storedData) {
+    budgetData = JSON.parse(storedData);
+  }
+  document.getElementById('apiTokenInput').value = AI_CONFIG.token;
+  
   renderTable();
 
   // Chatbot Logic
@@ -2313,6 +2350,11 @@
     addChatMessage(prompt, true);
     chatInput.value = '';
 
+    if (!AI_CONFIG.token) {
+      addChatMessage("❌ API Token is missing. Please go to Menu > Settings and save your Hugging Face token to use the AI features.", false);
+      return;
+    }
+
     // Efficient Context: Summarize totals and send recent transactions
     const totalExp = document.getElementById('totalDebit').textContent;
     const totalInc = document.getElementById('totalCredit').textContent;
@@ -2333,20 +2375,23 @@
 
       const response = await fetch(AI_CONFIG.endpoint, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${AI_CONFIG.token}`
+        },
         body: JSON.stringify({
-          model: AI_CONFIG.model,
-          prompt: `Context: ${dataContext}\n\nUser Question: ${prompt}\nAnswer as a professional financial assistant. Be concise.`,
-          stream: false
+          inputs: `<s>[INST] Context: ${dataContext}\n\nUser Question: ${prompt}\nAnswer as a professional financial assistant. Be concise. [/INST]`,
+          parameters: { max_new_tokens: 250 }
         }),
         signal: controller.signal
       });
       clearTimeout(timeoutId);
 
       const result = await response.json();
-      thinkingMsg.textContent = result.response;
+      // Hugging Face returns an array: [{ generated_text: "..." }]
+      thinkingMsg.textContent = result[0].generated_text.split('[/INST]').pop().trim();
     } catch (e) {
-      thinkingMsg.textContent = "❌ Connection Error: Ensure Ollama is running, 'phi3' is pulled, and OLLAMA_ORIGINS='*' is set.";
+      thinkingMsg.textContent = "❌ Connection Error: Check your API token or service status.";
     }
   }
 
