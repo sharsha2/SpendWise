@@ -1068,6 +1068,8 @@
   };
 
   let budgetData = [];
+  let chatHistory = [];
+  let comparisonData = [];
   let lastUploadData = null;
   let editIndex = -1;
   let incomeExpenseChart = null;
@@ -1546,6 +1548,7 @@
     
     if (editIndex > -1) {
       budgetData[editIndex] = entry;
+      comparisonData = []; // Clear comparison context when dashboard data changes
       editIndex = -1;
       addBtn.innerHTML = '<i class="fas fa-plus"></i>';
       addBtn.setAttribute('data-tooltip', 'Add Entry');
@@ -1764,6 +1767,7 @@
   function clearTable() {
     if (confirm('🗑️ Clear all data? This action cannot be undone.')) {
       budgetData = [];
+      comparisonData = [];
       saveToLocalStorage();
       editIndex = -1;
       addBtn.innerHTML = '<i class="fas fa-plus"></i>';
@@ -1817,6 +1821,7 @@
         }
         lastUploadData = jsonData;
         budgetData = jsonData;
+        comparisonData = [];
       saveToLocalStorage();
         renderTable();
         showStatus('✅ Excel file uploaded successfully!');
@@ -1833,6 +1838,7 @@
     if (!files || files.length === 0) return;
 
     const allMonthlyData = {};
+    const allTransactions = [];
     let grandTotalIncome = 0;
     let grandTotalExpense = 0;
     document.getElementById('comparisonSummary').style.display = 'none';
@@ -1848,6 +1854,7 @@
             const jsonData = XLSX.utils.sheet_to_json(firstSheet);
             
             jsonData.forEach(row => {
+              allTransactions.push(row);
               if (row['Date']) {
                 const parts = row['Date'].split('-');
                 if (parts.length >= 2) {
@@ -1872,6 +1879,7 @@
 
     try {
       await Promise.all(filePromises);
+      comparisonData = allTransactions;
 
       Object.values(allMonthlyData).forEach(m => {
         grandTotalIncome += m.income;
@@ -2385,21 +2393,56 @@
     addChatMessage(prompt, true);
     chatInput.value = '';
 
+    // Prefer comparison data if multiple months were recently uploaded, 
+    // otherwise use the main dashboard data
+    const isComparison = comparisonData && comparisonData.length > 0;
+    const sourceData = isComparison ? comparisonData : budgetData;
+
+    // Recalculate totals based on the active dataset to ensure AI accuracy
+    let totalExpNum = 0, totalIncNum = 0;
+    sourceData.forEach(r => {
+      totalExpNum += Number(r['Debit [D]']) || 0;
+      totalIncNum += Number(r['Credit [C]']) || 0;
+    });
+
+    const totalExp = totalExpNum.toFixed(2);
+    const totalInc = totalIncNum.toFixed(2);
+
+    // Add user message to history
+    chatHistory.push({ role: "user", parts: [{ text: prompt }] });
+
     if (!AI_CONFIG.token) {
       addChatMessage("❌ API Token is missing. Please go to Menu > Settings and save your Google Gemini API key to use the AI features.", false);
       return;
     }
 
-    // Efficient Context: Summarize totals and send recent transactions
-    const totalExp = document.getElementById('totalDebit').textContent;
-    const totalInc = document.getElementById('totalCredit').textContent;
-    const recentData = budgetData.map(r => `- ${r.Date}: ${r['Purchased Store']} $${r['Amount Total']}`).join('\n');
-    
-    const dataContext = `
-      Summary: Total Expenses $${totalExp}, Total Income $${totalInc}.
-      Recent Transactions:
-      ${recentData}
-      (Total entries in history: ${budgetData.length})
+    // Format data as a structured table for the LLM
+    const dataTable = sourceData.map(r => {
+      const cat = categorizeStore(r['Purchased Store'] || '');
+      return `| ${r.Date} | ${r['Purchased Store']} | ${cat} | ${r['Purchased By']} | $${r['Amount Total']} |`;
+    }).join('\n');
+
+    const today = new Date().toISOString().split('T')[0];
+    const systemInstruction = `
+      You are SpendWise AI, a world-class personal finance analyst and advisor. Today's date is ${today}.
+      Your goal is to provide precise, data-driven insights to help the user manage their finances effectively.
+
+      ### FINANCIAL DATA CONTEXT
+      - Active Mode: ${isComparison ? 'Comparative Multi-Month Analysis' : 'Single Month Dashboard View'}
+      - Summary Totals: Expenses $${totalExp} | Income $${totalInc}
+      - Current Net Cashflow: $${(totalIncNum - totalExpNum).toFixed(2)}
+      - Transaction Schema: | Date | Description | Category | Payer | Amount |
+
+      ### TRANSACTION DATASET
+      ${dataTable}
+
+      ### OPERATIONAL GUIDELINES
+      1. **Quantitative Accuracy**: When asked for totals or averages, perform exact arithmetic using the provided data.
+      2. **Trend Analysis**: Identify spending patterns, recurring expenses, and outliers. If in Multi-Month mode, explicitly compare month-over-month performance.
+      3. **Categorization Awareness**: Use the 'Category' column to group data. If a store is 'Other', try to infer its purpose from the description.
+      4. **Professional Tone**: Maintain an objective, helpful, and encouraging persona. Avoid generic financial advice; keep responses grounded in the provided data.
+      5. **Markdown Formatting**: Use bold text for currency amounts ($), bullet points for insights, and Markdown tables for any lists or comparisons.
+      6. **Integrity**: If the data does not contain sufficient information to answer a question, state that clearly rather than guessing.
     `;
 
     const thinkingMsg = addChatMessage("Analyzing...", false);
@@ -2415,9 +2458,8 @@
           'X-goog-api-key': AI_CONFIG.token
         },
         body: JSON.stringify({
-          contents: [{
-            parts: [{ text: `Context: ${dataContext}\n\nUser Question: ${prompt}\nAnswer as a professional financial assistant. Be concise.` }]
-          }]
+          system_instruction: { parts: [{ text: systemInstruction }] },
+          contents: chatHistory
         }),
         signal: controller.signal
       });
@@ -2436,6 +2478,10 @@
 
       const aiResponse = result.candidates?.[0]?.content?.parts?.[0]?.text;
       thinkingMsg.textContent = aiResponse?.trim() || "I received an empty response from the AI.";
+      
+      // Add AI response to history
+      chatHistory.push({ role: "model", parts: [{ text: thinkingMsg.textContent }] });
+
     } catch (e) {
       console.error('AI Error:', e);
       if (e.name === 'AbortError') {
