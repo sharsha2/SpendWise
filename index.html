@@ -2422,7 +2422,6 @@
       const result = await response.json();
 
       if (!response.ok) {
-
         if (response.status === 429) {
           thinkingMsg.textContent = "❌ Rate limit reached. The free tier of Gemini has limits on how many questions you can ask per minute. Please wait a moment.";
         } else {
