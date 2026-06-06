@@ -2389,9 +2389,11 @@
 
       const result = await response.json();
       // Hugging Face returns an array: [{ generated_text: "..." }]
-      thinkingMsg.textContent = result[0].generated_text.split('[/INST]').pop().trim();
+      if (result.error) throw new Error(result.error);
+      thinkingMsg.textContent = result[0]?.generated_text?.split('[/INST]').pop().trim() || "I couldn't generate a response.";
     } catch (e) {
-      thinkingMsg.textContent = "❌ Connection Error: Check your API token or service status.";
+      console.error('AI Error:', e);
+      thinkingMsg.textContent = `❌ AI Error: ${e.message.includes('token') ? 'Invalid or missing API Token.' : 'Check your connection or service status.'}`;
     }
   }
 
