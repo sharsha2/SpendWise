@@ -2381,19 +2381,35 @@
         },
         body: JSON.stringify({
           inputs: `<s>[INST] Context: ${dataContext}\n\nUser Question: ${prompt}\nAnswer as a professional financial assistant. Be concise. [/INST]`,
-          parameters: { max_new_tokens: 250 }
+          parameters: { 
+            max_new_tokens: 250,
+            return_full_text: false
+          }
         }),
         signal: controller.signal
       });
       clearTimeout(timeoutId);
 
       const result = await response.json();
-      // Hugging Face returns an array: [{ generated_text: "..." }]
-      if (result.error) throw new Error(result.error);
-      thinkingMsg.textContent = result[0]?.generated_text?.split('[/INST]').pop().trim() || "I couldn't generate a response.";
+
+      if (!response.ok) {
+        if (response.status === 503) {
+          thinkingMsg.textContent = `⏳ AI is warming up. Please try again in about ${Math.ceil(result.estimated_time || 20)} seconds.`;
+        } else {
+          thinkingMsg.textContent = `❌ AI Error: ${result.error || 'The request failed.'}`;
+        }
+        return;
+      }
+
+      const aiResponse = Array.isArray(result) ? result[0]?.generated_text : result.generated_text;
+      thinkingMsg.textContent = aiResponse?.trim() || "I received an empty response from the AI.";
     } catch (e) {
-      console.error('AI Error:', e);
-      thinkingMsg.textContent = `❌ AI Error: ${e.message.includes('token') ? 'Invalid or missing API Token.' : 'Check your connection or service status.'}`;
+      if (e.name === 'AbortError') {
+        thinkingMsg.textContent = "❌ Error: Request timed out. Try asking a shorter question.";
+      } else {
+        console.error('AI Error:', e);
+        thinkingMsg.textContent = `❌ Connection Error: ${e.message}`;
+      }
     }
   }
 
