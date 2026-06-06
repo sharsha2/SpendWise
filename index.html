@@ -1063,7 +1063,7 @@
   // Centralized App Configuration
   const APP_NAME = "SpendWise";
   const AI_CONFIG = {
-    endpoint: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent',
+    endpoint: 'https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent',
     get token() { return localStorage.getItem('spendwise_api_token') || ''; }
   };
 
@@ -2391,7 +2391,7 @@
     // Efficient Context: Summarize totals and send recent transactions
     const totalExp = document.getElementById('totalDebit').textContent;
     const totalInc = document.getElementById('totalCredit').textContent;
-    const recentData = budgetData.slice(-10).map(r => `- ${r.Date}: ${r['Purchased Store']} $${r['Amount Total']}`).join('\n');
+    const recentData = budgetData.map(r => `- ${r.Date}: ${r['Purchased Store']} $${r['Amount Total']}`).join('\n');
     
     const dataContext = `
       Summary: Total Expenses $${totalExp}, Total Income $${totalInc}.
@@ -2425,7 +2425,7 @@
         if (response.status === 429) {
           thinkingMsg.textContent = "❌ Rate limit reached. The free tier of Gemini has limits on how many questions you can ask per minute. Please wait a moment.";
         } else {
-        thinkingMsg.textContent = `❌ AI Error: ${result.error?.message || 'The request failed.'}`;
+          thinkingMsg.textContent = `❌ AI Error: ${result.error?.message || 'The request failed.'}`;
         }
         return;
       }
