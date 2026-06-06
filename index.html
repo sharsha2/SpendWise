@@ -1020,15 +1020,15 @@
       </div>
 
       <div class="section-card" style="padding: 15px; grid-column: span 2;">
-        <div class="section-header" style="font-size: 0.9em;"><i class="fas fa-key"></i> AI API Token (Hugging Face)</div>
+        <div class="section-header" style="font-size: 0.9em;"><i class="fas fa-key"></i> AI API Token (Google Gemini)</div>
         <div style="display: flex; gap: 5px;">
-          <input type="password" id="apiTokenInput" placeholder="Enter your HF Token here" style="padding: 8px;">
+          <input type="password" id="apiTokenInput" placeholder="Enter Gemini API Key here" style="padding: 8px;">
           <div style="display: flex; gap: 5px;">
             <button class="action-btn primary" onclick="saveApiToken()" style="width: 80px;">Save</button>
             <button class="action-btn ghost" onclick="testAIConnection()" style="width: 130px; font-size: 12px;"><i class="fas fa-vial"></i> Test API</button>
           </div>
         </div>
-        <div style="font-size: 11px; margin-top: 5px; color: #777;">Your token is saved locally in your browser and never sent to GitHub.</div>
+        <div style="font-size: 11px; margin-top: 5px; color: #777;">Your token is saved locally in your browser and never sent to GitHub. Get a key at <a href="https://aistudio.google.com/" target="_blank" style="color: var(--primary-color);">Google AI Studio</a>.</div>
       </div>
     </div>
     <div style="text-align: center; color: #777; font-size: 12px; margin-top: 10px;">
@@ -1063,7 +1063,7 @@
   // Centralized App Configuration
   const APP_NAME = "SpendWise";
   const AI_CONFIG = {
-    endpoint: 'https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2',
+    endpoint: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent',
     get token() { return localStorage.getItem('spendwise_api_token') || ''; }
   };
 
@@ -1243,24 +1243,25 @@
       showStatus('⚠️ Please enter a token first.', true);
       return;
     }
-    showStatus('🧪 Testing connection to Hugging Face...');
+    showStatus('🧪 Testing connection to Google Gemini...');
     try {
-      const response = await fetch(AI_CONFIG.endpoint, {
+      const url = `${AI_CONFIG.endpoint}?key=${token}`;
+      const response = await fetch(url, {
         method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
-        },
-        body: JSON.stringify({ inputs: "ping" })
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: "ping" }] }]
+        })
       });
       const result = await response.json();
-      if (response.ok || response.status === 503) {
+      
+      if (response.ok) {
         showStatus('✅ Connection successful! AI is reachable.');
       } else {
-        showStatus(`❌ API Error: ${result.error || 'Invalid Token'}`, true);
+        showStatus(`❌ API Error: ${result.error?.message || 'Invalid Token'}`, true);
       }
     } catch (e) {
-      showStatus(`❌ Network Error: Could not reach Hugging Face. Please check your DNS settings.`, true);
+      showStatus(`❌ Network Error: Could not reach Google Gemini. Please check your connection.`, true);
     }
   }
 
@@ -2383,7 +2384,7 @@
     chatInput.value = '';
 
     if (!AI_CONFIG.token) {
-      addChatMessage("❌ API Token is missing. Please go to Menu > Settings and save your Hugging Face token to use the AI features.", false);
+      addChatMessage("❌ API Token is missing. Please go to Menu > Settings and save your Google Gemini API key to use the AI features.", false);
       return;
     }
 
@@ -2405,18 +2406,14 @@
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout
 
-      const response = await fetch(AI_CONFIG.endpoint, {
+      const url = `${AI_CONFIG.endpoint}?key=${AI_CONFIG.token}`;
+      const response = await fetch(url, {
         method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${AI_CONFIG.token}`
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          inputs: `<s>[INST] Context: ${dataContext}\n\nUser Question: ${prompt}\nAnswer as a professional financial assistant. Be concise. [/INST]`,
-          parameters: { 
-            max_new_tokens: 250,
-            return_full_text: false
-          }
+          contents: [{
+            parts: [{ text: `Context: ${dataContext}\n\nUser Question: ${prompt}\nAnswer as a professional financial assistant. Be concise.` }]
+          }]
         }),
         signal: controller.signal
       });
@@ -2425,22 +2422,23 @@
       const result = await response.json();
 
       if (!response.ok) {
-        if (response.status === 503) {
-          thinkingMsg.textContent = `⏳ AI is warming up. Please try again in about ${Math.ceil(result.estimated_time || 20)} seconds.`;
+
+        if (response.status === 429) {
+          thinkingMsg.textContent = "❌ Rate limit reached. The free tier of Gemini has limits on how many questions you can ask per minute. Please wait a moment.";
         } else {
-          thinkingMsg.textContent = `❌ AI Error: ${result.error || 'The request failed.'}`;
+        thinkingMsg.textContent = `❌ AI Error: ${result.error?.message || 'The request failed.'}`;
         }
         return;
       }
 
-      const aiResponse = Array.isArray(result) ? result[0]?.generated_text : result.generated_text;
+      const aiResponse = result.candidates?.[0]?.content?.parts?.[0]?.text;
       thinkingMsg.textContent = aiResponse?.trim() || "I received an empty response from the AI.";
     } catch (e) {
       console.error('AI Error:', e);
       if (e.name === 'AbortError') {
         thinkingMsg.textContent = "❌ Error: Request timed out. Try asking a shorter question.";
       } else if (e instanceof TypeError) {
-        thinkingMsg.textContent = "❌ Network Error: Could not reach the AI service. Please check your internet connection or if the domain is blocked.";
+        thinkingMsg.textContent = "❌ Network Error: Could not reach Google Gemini. Please check your internet connection.";
       } else {
         thinkingMsg.textContent = `❌ Connection Error: ${e.message}`;
       }
