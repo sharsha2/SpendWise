@@ -1023,7 +1023,10 @@
         <div class="section-header" style="font-size: 0.9em;"><i class="fas fa-key"></i> AI API Token (Hugging Face)</div>
         <div style="display: flex; gap: 5px;">
           <input type="password" id="apiTokenInput" placeholder="Enter your HF Token here" style="padding: 8px;">
-          <button class="action-btn primary" onclick="saveApiToken()" style="width: 100px;">Save</button>
+          <div style="display: flex; gap: 5px;">
+            <button class="action-btn primary" onclick="saveApiToken()" style="width: 80px;">Save</button>
+            <button class="action-btn ghost" onclick="testAIConnection()" style="width: 130px; font-size: 12px;"><i class="fas fa-vial"></i> Test API</button>
+          </div>
         </div>
         <div style="font-size: 11px; margin-top: 5px; color: #777;">Your token is saved locally in your browser and never sent to GitHub.</div>
       </div>
@@ -1231,6 +1234,33 @@
     if (token) {
       localStorage.setItem('spendwise_api_token', token);
       showStatus('🔑 API Token saved locally!');
+    }
+  }
+
+  async function testAIConnection() {
+    const token = document.getElementById('apiTokenInput').value.trim();
+    if (!token) {
+      showStatus('⚠️ Please enter a token first.', true);
+      return;
+    }
+    showStatus('🧪 Testing connection to Hugging Face...');
+    try {
+      const response = await fetch(AI_CONFIG.endpoint, {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ inputs: "ping" })
+      });
+      const result = await response.json();
+      if (response.ok || response.status === 503) {
+        showStatus('✅ Connection successful! AI is reachable.');
+      } else {
+        showStatus(`❌ API Error: ${result.error || 'Invalid Token'}`, true);
+      }
+    } catch (e) {
+      showStatus(`❌ Network Error: Could not reach Hugging Face. Please check your DNS settings.`, true);
     }
   }
 
@@ -2406,10 +2436,12 @@
       const aiResponse = Array.isArray(result) ? result[0]?.generated_text : result.generated_text;
       thinkingMsg.textContent = aiResponse?.trim() || "I received an empty response from the AI.";
     } catch (e) {
+      console.error('AI Error:', e);
       if (e.name === 'AbortError') {
         thinkingMsg.textContent = "❌ Error: Request timed out. Try asking a shorter question.";
+      } else if (e instanceof TypeError) {
+        thinkingMsg.textContent = "❌ Network Error: Could not reach the AI service. Please check your internet connection or if the domain is blocked.";
       } else {
-        console.error('AI Error:', e);
         thinkingMsg.textContent = `❌ Connection Error: ${e.message}`;
       }
     }
