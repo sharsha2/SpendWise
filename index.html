@@ -115,6 +115,12 @@
       margin-bottom: 30px;
     }
     
+    @media (max-width: 768px) {
+      .dashboard {
+        gap: 15px;
+      }
+    }
+    
     @media (max-width: 1200px) {
       .dashboard {
         grid-template-columns: 1fr;
@@ -325,10 +331,11 @@
       margin-bottom: 15px;
     }
 
-    @media (max-width: 1024px) {
+    @media (max-width: 1100px) {
       .table-header {
         flex-direction: column;
         align-items: stretch;
+        text-align: center;
       }
     }
     
@@ -337,6 +344,7 @@
       gap: 10px;
       align-items: center;
       flex-wrap: wrap;
+      justify-content: center;
     }
     
     .chart-buttons {
@@ -442,6 +450,7 @@
         display: grid;
         grid-template-columns: 1fr;
         width: 100%;
+        padding: 0 10px;
       }
       .pill {
         min-width: 0 !important;
@@ -967,7 +976,10 @@
   <div id="chatbot-window">
     <div class="chatbot-header">
       <span><i class="fas fa-brain"></i> SpendWise AI</span>
-      <i class="fas fa-times" style="cursor:pointer;" onclick="document.getElementById('chatbot-window').classList.remove('show')"></i>
+      <div style="display: flex; gap: 15px; align-items: center;">
+        <i class="fas fa-minus" title="Minimize" style="cursor:pointer; font-size: 14px;" onclick="document.getElementById('chatbot-window').classList.remove('show')"></i>
+        <i class="fas fa-times" title="Close" style="cursor:pointer;" onclick="document.getElementById('chatbot-window').classList.remove('show')"></i>
+      </div>
     </div>
     <div class="chatbot-messages" id="chatbot-messages">
       <div class="chat-msg ai" style="background: var(--primary-color); color: white; padding: 10px 14px; border-radius: 12px; align-self: flex-start; font-size: 14px;">
