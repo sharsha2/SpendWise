@@ -10,7 +10,7 @@
   <style>
     :root { 
       --gap: 12px; 
-      --primary-color: #2563EB;
+      --primary-color: #F97316; /* Orange 500 */
       --secondary-color: #1E293B;
       --accent-color: #F1F5F9;
       --success-color: #10B981;
@@ -44,7 +44,7 @@
     }
 
     [data-theme="dark"] {
-      --primary-color: #3B82F6;
+      --primary-color: #FB923C; /* Orange 400 */
       --secondary-color: #F8FAFC;
       --accent-color: #334155;
       --danger-color: #EF4444;
@@ -126,6 +126,21 @@
       gap: 25px;
       margin-bottom: 30px;
     }
+
+    .budget-progress-container {
+      margin-top: 15px;
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 15px;
+    }
+    .budget-item {
+      background: var(--light-color);
+      padding: 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border-color);
+    }
+    .progress-bar-bg { background: #E2E8F0; height: 8px; border-radius: 4px; margin-top: 8px; overflow: hidden; }
+    .progress-bar-fill { height: 100%; background: var(--primary-color); transition: width 0.3s; }
     
     @media (max-width: 768px) {
       .dashboard {
@@ -292,7 +307,7 @@
     input:focus, select:focus { 
       outline: none; 
       border-color: var(--primary-color); 
-      box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.1); 
+      box-shadow: 0 0 0 4px rgba(124, 58, 237, 0.1); 
     }
     
     button { 
@@ -311,7 +326,7 @@
     }
     
     button.primary:hover { 
-      background: #4338CA;
+      background: #6D28D9;
       box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);
     }
     
@@ -905,6 +920,10 @@
       <div class="pill">💰 Total Income: $<span id="totalCredit">0.00</span></div>
       <div class="pill">📊 Net Balance: $<span id="netTotal">0.00</span></div>
     </div>
+    <div id="budgetTrackingSection" style="display: none; border-top: 1px solid var(--border-color); margin-top: 20px; padding-top: 15px;">
+      <div class="section-header" style="font-size: 0.9em; margin-bottom: 10px;"><i class="fas fa-bullseye"></i> Monthly Budget Tracking</div>
+      <div class="budget-progress-container" id="budgetProgressList"></div>
+    </div>
   </section>
 
   <!-- Dashboard & Add Entry View -->
@@ -931,6 +950,7 @@
       </div>
       <div class="bar">
         <button class="action-btn primary" id="addBtn" data-tooltip="Add Entry"><i class="fas fa-plus"></i></button>
+        <button class="action-btn primary" id="applyRecurringBtn" data-tooltip="Apply Recurring Transactions" style="background: #8B5CF6;"><i class="fas fa-redo"></i></button>
         <button class="action-btn ghost" id="cancelEditBtn" data-tooltip="Cancel Edit" style="display: none;"><i class="fas fa-times"></i></button>
         <button class="action-btn ghost" id="resetFormBtn" data-tooltip="Clear Form"><i class="fas fa-eraser"></i></button>
         <button class="action-btn ghost" id="downloadBtn" data-tooltip="Download Excel"><i class="fas fa-download"></i></button>
@@ -1107,6 +1127,33 @@
       </div>
 
       <div class="section-card" style="padding: 15px; grid-column: span 2;">
+        <div class="section-header" style="font-size: 0.9em;"><i class="fas fa-bullseye"></i> Monthly Budgets</div>
+        <div style="display: flex; gap: 5px; margin-bottom: 10px;">
+          <input type="text" id="budgetTarget" placeholder="Category or Store Name" style="padding: 8px;">
+          <input type="number" id="budgetAmount" placeholder="Limit $" style="padding: 8px; width: 100px;">
+          <button class="action-btn primary" onclick="addBudgetSetting()" style="width: 35px; height: 35px;"><i class="fas fa-plus"></i></button>
+        </div>
+        <div id="budgetsList" class="budget-progress-container" style="font-size: 13px;"></div>
+      </div>
+
+      <div class="section-card" style="padding: 15px; grid-column: span 2;">
+        <div class="section-header" style="font-size: 0.9em;"><i class="fas fa-calendar-check"></i> Recurring Transactions</div>
+        <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; margin-bottom: 10px;">
+          <input type="text" id="recDesc" placeholder="Description" style="padding: 6px;">
+          <input type="number" id="recAmount" placeholder="Amount" style="padding: 6px;">
+          <input type="number" id="recDay" placeholder="Day (1-31)" style="padding: 6px;">
+          <select id="recPayer" style="padding: 6px;"></select>
+          <select id="recBank" style="padding: 6px;"></select>
+          <select id="recType" style="padding: 6px;">
+            <option value="D">Debit</option>
+            <option value="C">Credit</option>
+          </select>
+          <button class="action-btn primary" onclick="addRecurringSetting()" style="height: 35px; width: 100%;"><i class="fas fa-plus"></i> Add</button>
+        </div>
+        <div id="recurringList" style="max-height: 200px; overflow-y: auto; font-size: 13px;"></div>
+      </div>
+
+      <div class="section-card" style="padding: 15px; grid-column: span 2;">
         <div class="section-header" style="font-size: 0.9em;"><i class="fas fa-key"></i> AI API Token (Google Gemini)</div>
         <div style="display: flex; gap: 5px;">
           <input type="password" id="apiTokenInput" placeholder="Enter Gemini API Key here" style="padding: 8px;">
@@ -1176,10 +1223,10 @@
   const chartColors = {
     income: '#059669',   // Emerald 600
     expense: '#EF4444',  // Rose
-    primary: '#2563EB',  // Blue 600
+    primary: '#F97316',  // Orange 500
     palette: [
-      '#3B82F6', '#10B981', '#F59E0B', '#F43F5E', '#8B5CF6', 
-      '#06B6D4', '#6366F1', '#D946EF', '#F97316', '#14B8A6'
+      '#F97316', '#10B981', '#F59E0B', '#F43F5E', '#8B5CF6', /* Orange, Emerald, Amber, Rose, Violet */
+      '#06B6D4', '#6366F1', '#D946EF', '#14B8A6', '#0D9488' /* Cyan, Indigo, Fuchsia, Light Teal, Teal */
     ],
     backgrounds: [
       '#EEF2FF', '#ECFDF5', '#FFFBEB', '#FEF2F2', '#EFF6FF'
@@ -1246,7 +1293,9 @@
   function getSettings() {
     const defaultSettings = {
       people: ['Harsha', 'Cherry'],
-      banks: ['Scotia Debit', 'Scotia Credit', 'Amex', 'PC', 'Wealthsimple', 'Simplii']
+      banks: ['Scotia Debit', 'Scotia Credit', 'Amex', 'PC', 'Wealthsimple', 'Simplii'],
+      budgets: {}, // { "Groceries": 600 }
+      recurring: [] // [ {desc, amount, day, payer, bank, type} ]
     };
     const stored = localStorage.getItem('spendwise_settings');
     return stored ? JSON.parse(stored) : defaultSettings;
@@ -1279,10 +1328,40 @@
     updateDropdowns();
   }
 
+  function addBudgetSetting() {
+    const target = document.getElementById('budgetTarget').value.trim();
+    const amount = parseFloat(document.getElementById('budgetAmount').value);
+    if (!target || isNaN(amount)) return;
+    const settings = getSettings();
+    settings.budgets[target] = amount;
+    saveSettings(settings);
+    populateSettingsUI();
+    renderTable(); // Refresh budget tracking
+  }
+
+  function addRecurringSetting() {
+    const desc = document.getElementById('recDesc').value.trim();
+    const amount = parseFloat(document.getElementById('recAmount').value);
+    const day = parseInt(document.getElementById('recDay').value);
+    if (!desc || isNaN(amount) || isNaN(day)) return;
+    
+    const settings = getSettings();
+    settings.recurring.push({
+      desc, amount, day, 
+      payer: document.getElementById('recPayer').value,
+      bank: document.getElementById('recBank').value,
+      type: document.getElementById('recType').value
+    });
+    saveSettings(settings);
+    populateSettingsUI();
+  }
+
   function populateSettingsUI() {
     const settings = getSettings();
     const pList = document.getElementById('peopleList');
     const bList = document.getElementById('banksList');
+    const budList = document.getElementById('budgetsList');
+    const recList = document.getElementById('recurringList');
     
     pList.innerHTML = settings.people.map((p, i) => 
       `<div style="display:flex; justify-content:space-between; padding:5px; border-bottom:1px solid var(--border-color);">
@@ -1293,6 +1372,37 @@
       `<div style="display:flex; justify-content:space-between; padding:5px; border-bottom:1px solid var(--border-color);">
         ${b} <i class="fas fa-times" style="color:var(--danger-color); cursor:pointer;" onclick="removeSettingItem('banks', ${i})"></i>
       </div>`).join('');
+
+    budList.innerHTML = Object.entries(settings.budgets).map(([k, v]) => 
+      `<div class="budget-item" style="display:flex; justify-content:space-between; align-items:center;">
+        <span><strong>${k}</strong>: $${v}</span>
+        <i class="fas fa-times" style="color:var(--danger-color); cursor:pointer;" onclick="removeBudget('${k}')"></i>
+      </div>`).join('');
+
+    recList.innerHTML = settings.recurring.map((r, i) => 
+      `<div style="display:flex; justify-content:space-between; padding:8px; border-bottom:1px solid var(--border-color);">
+        <span>[Day ${r.day}] <strong>${r.desc}</strong> - $${r.amount} (${r.payer})</span>
+        <i class="fas fa-times" style="color:var(--danger-color); cursor:pointer;" onclick="removeRecurring(${i})"></i>
+      </div>`).join('');
+
+    // Sync dropdowns in recurring form
+    document.getElementById('recPayer').innerHTML = settings.people.map(p => `<option value="${p}">${p}</option>`).join('');
+    document.getElementById('recBank').innerHTML = settings.banks.map(b => `<option value="${b}">${b}</option>`).join('');
+  }
+
+  function removeBudget(key) {
+    const settings = getSettings();
+    delete settings.budgets[key];
+    saveSettings(settings);
+    populateSettingsUI();
+    renderTable();
+  }
+
+  function removeRecurring(index) {
+    const settings = getSettings();
+    settings.recurring.splice(index, 1);
+    saveSettings(settings);
+    populateSettingsUI();
   }
 
   function updateDropdowns() {
@@ -1381,6 +1491,7 @@
   const uploadFile = document.getElementById('uploadFile');
   const clearBtn = document.getElementById('clearBtn');
   const resetFormBtn = document.getElementById('resetFormBtn');
+  const applyRecurringBtn = document.getElementById('applyRecurringBtn');
   const copyAIBtn = document.getElementById('copyAIBtn');
   const filterStartDate = document.getElementById('filterStartDate');
   const filterEndDate = document.getElementById('filterEndDate');
@@ -1449,6 +1560,37 @@
   compareFilesInput.addEventListener('change', uploadMultipleExcel);
   clearBtn.addEventListener('click', clearTable);
   
+  applyRecurringBtn.addEventListener('click', () => {
+    const settings = getSettings();
+    if (settings.recurring.length === 0) {
+      showStatus('⚠️ No recurring transactions defined in Settings.', true);
+      return;
+    }
+    
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    
+    let count = 0;
+    settings.recurring.forEach(r => {
+      const day = String(r.day).padStart(2, '0');
+      const entry = {
+        'Date': `${year}-${month}-${day}`,
+        'Purchased By': r.payer,
+        'Purchased Store': r.desc,
+        'Bank Name': r.bank,
+        'Debit [D]': r.type === 'D' ? r.amount : '',
+        'Credit [C]': r.type === 'C' ? r.amount : '',
+        'Amount Total': r.amount
+      };
+      budgetData.push(entry);
+      count++;
+    });
+    
+    renderTable();
+    showStatus(`✅ Applied ${count} recurring transactions for the current month!`);
+  });
+
   // Add event listeners for chart buttons
   showIncomeExpense.addEventListener('click', () => {
     updateIncomeExpenseChart();
@@ -1762,6 +1904,44 @@
     tbody.appendChild(summaryRow);
     
     updateTotals();
+    renderBudgetTracking();
+  }
+
+  function renderBudgetTracking() {
+    const settings = getSettings();
+    const list = document.getElementById('budgetProgressList');
+    const section = document.getElementById('budgetTrackingSection');
+    
+    if (Object.keys(settings.budgets).length === 0 || budgetData.length === 0) {
+      section.style.display = 'none';
+      return;
+    }
+    
+    section.style.display = 'block';
+    list.innerHTML = '';
+    
+    Object.entries(settings.budgets).forEach(([target, limit]) => {
+      // Calculate spent for this budget item
+      const spent = budgetData.reduce((sum, r) => {
+        const cat = categorizeStore(r['Purchased Store'] || '');
+        const matches = (cat === target || (r['Purchased Store'] || '').toLowerCase().includes(target.toLowerCase()));
+        return matches ? sum + (Number(r['Debit [D]']) || 0) : sum;
+      }, 0);
+      
+      const percent = Math.min((spent / limit) * 100, 100);
+      const color = percent >= 100 ? 'var(--danger-color)' : percent > 80 ? 'var(--warning-color)' : 'var(--primary-color)';
+      
+      const item = document.createElement('div');
+      item.className = 'budget-item';
+      item.innerHTML = `
+        <div style="display:flex; justify-content:space-between; font-size:12px; font-weight:700;">
+          <span>${target}</span>
+          <span>$${spent.toFixed(0)} / $${limit}</span>
+        </div>
+        <div class="progress-bar-bg"><div class="progress-bar-fill" style="width: ${percent}%; background: ${color};"></div></div>
+      `;
+      list.appendChild(item);
+    });
   }
 
   function editRow(index) {
