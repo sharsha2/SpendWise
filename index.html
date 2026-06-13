@@ -26,12 +26,20 @@
       --shadow: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);
     }
 
-    @media (max-width: 768px) {
-      :root {
-        --gap: 8px;
-      }
+    @media (max-width: 600px) {
       body {
-        padding: 10px;
+        padding: 8px;
+      }
+      .container {
+        padding: 0;
+      }
+      .section-card {
+        padding: 16px;
+        margin-bottom: 12px;
+      }
+      th, td {
+        padding: 10px 8px;
+        font-size: 13px;
       }
     }
 
@@ -75,13 +83,15 @@
       padding: 25px;
       border-radius: var(--border-radius);
       box-shadow: var(--shadow);
-      margin-bottom: 25px;
+      margin-bottom: 20px;
     }
     
     .header {
-      text-align: left;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
       margin-bottom: 20px;
-      padding: 20px 25px;
+      padding: 15px 25px;
       background: var(--card-bg);
       border-radius: var(--border-radius);
       box-shadow: var(--shadow);
@@ -89,21 +99,23 @@
 
     @media (max-width: 600px) {
       .header {
+        flex-direction: column;
+        gap: 12px;
         padding: 15px;
-        text-align: center;
-        margin-bottom: 15px;
+        margin-bottom: 12px;
       }
     }
     
     h1 { 
-      color: var(--secondary-color); 
-      font-size: 1.5em; 
+      color: var(--primary-color); 
+      font-size: 1.8em; 
       font-weight: 800;
-      margin-bottom: 0;
+      letter-spacing: -1px;
+      margin: 0;
     }
     
     .subtitle {
-      color: var(--secondary-color);
+      color: var(--text-color);
       opacity: 0.8;
       font-size: 1.1em;
     }
@@ -154,9 +166,6 @@
     
     /* Hamburger Menu & View Styles */
     .nav-container {
-      position: absolute;
-      top: 20px;
-      right: 25px;
       z-index: 1000;
     }
 
@@ -175,8 +184,8 @@
     }
     .hamburger-btn {
       background: var(--card-bg);
-      color: var(--secondary-color);
-      border: 1px solid #E2E8F0;
+      color: var(--text-color);
+      border: 1px solid var(--border-color);
       padding: 10px 20px;
       border-radius: 8px;
       cursor: pointer;
@@ -184,6 +193,7 @@
       font-weight: 600;
       display: flex;
       align-items: center;
+      width: auto;
       gap: 10px;
       transition: all 0.2s;
     }
@@ -241,6 +251,14 @@
     @keyframes fadeIn {
       from { opacity: 0; transform: translateY(10px); }
       to { opacity: 1; transform: translateY(0); }
+    }
+
+    @media (max-width: 600px) {
+      .section-header {
+        font-size: 1em;
+        justify-content: center;
+        margin-bottom: 15px;
+      }
     }
 
     .controls { 
@@ -469,7 +487,8 @@
       display: flex;
       flex-direction: column;
       align-items: center;
-      min-width: 200px;
+      min-width: 140px;
+      flex: 1;
     }
     
     .pill .label {
@@ -861,22 +880,21 @@
 <div class="container">
   <header class="header">
     <h1>SpendWise</h1>
-  </header>
-
-  <div class="nav-container">
-    <div class="hamburger-menu">
-      <button class="hamburger-btn" id="menuBtn">
-        <i class="fas fa-bars"></i> Menu
-      </button>
-      <div class="menu-options" id="menuOptions">
-        <div class="menu-option" onclick="showView('dashboard')"><i class="fas fa-columns"></i> Dashboard</div>
-        <div class="menu-option" onclick="openReportsHub()"><i class="fas fa-chart-line"></i> Financial Reports</div>
-        <div class="menu-option" onclick="openSettingsModal()"><i class="fas fa-cog"></i> Settings</div>
-        <div class="menu-option" onclick="openCompareModal()"><i class="fas fa-balance-scale"></i> Compare Months</div>
-        <div class="menu-option" onclick="toggleTheme()"><i id="themeIcon" class="fas fa-moon"></i> <span id="themeText">Dark Mode</span></div>
+    <div class="nav-container">
+      <div class="hamburger-menu">
+        <button class="hamburger-btn" id="menuBtn">
+          <i class="fas fa-bars"></i> Menu
+        </button>
+        <div class="menu-options" id="menuOptions">
+          <div class="menu-option" onclick="showView('dashboard')"><i class="fas fa-columns"></i> Dashboard</div>
+          <div class="menu-option" onclick="openReportsHub()"><i class="fas fa-chart-line"></i> Financial Reports</div>
+          <div class="menu-option" onclick="openSettingsModal()"><i class="fas fa-cog"></i> Settings</div>
+          <div class="menu-option" onclick="openCompareModal()"><i class="fas fa-balance-scale"></i> Compare Months</div>
+          <div class="menu-option" onclick="toggleTheme()"><i id="themeIcon" class="fas fa-moon"></i> <span id="themeText">Dark Mode</span></div>
+        </div>
       </div>
     </div>
-  </div>
+  </header>
 
   <div class="status-message" id="statusMessage"></div>
 
