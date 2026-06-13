@@ -851,7 +851,7 @@
 
 <div class="container">
   <header class="header">
-    <h1 id="greetingTitle">SpendWise</h1>
+    <h1>SpendWise</h1>
   </header>
 
   <div class="nav-container">
@@ -906,7 +906,6 @@
         <button class="action-btn primary" id="addBtn" data-tooltip="Add Entry"><i class="fas fa-plus"></i></button>
         <button class="action-btn ghost" id="cancelEditBtn" data-tooltip="Cancel Edit" style="display: none;"><i class="fas fa-times"></i></button>
         <button class="action-btn ghost" id="resetFormBtn" data-tooltip="Clear Form"><i class="fas fa-eraser"></i></button>
-        <button class="action-btn ghost" id="copyAIBtn" data-tooltip="Copy for AI"><i class="fas fa-robot"></i></button>
         <button class="action-btn ghost" id="downloadBtn" data-tooltip="Download Excel"><i class="fas fa-download"></i></button>
         <label class="action-btn ghost file-upload-btn" data-tooltip="Upload Excel">
           <i class="fas fa-file-import"></i>
@@ -1194,18 +1193,6 @@
     menuOptions.classList.remove('show');
   }
 
-  function updateGreeting() {
-    const hour = new Date().getHours();
-    const title = document.getElementById('greetingTitle');
-    let greeting = "";
-
-    if (hour < 12) greeting = "Good Morning";
-    else if (hour < 18) greeting = "Good Afternoon";
-    else greeting = "Good Evening";
-
-    title.innerHTML = `${APP_NAME} <span style="font-weight: 300; font-size: 0.8em; color: #94a3b8;">| ${greeting}</span>`;
-  }
-
   // Initialize or Load Category Keywords from LocalStorage
   function getCategoryMap() {
     return {
@@ -1332,10 +1319,6 @@
     }
   }
 
-  function saveToLocalStorage() {
-    localStorage.setItem('spendwise_budget_data', JSON.stringify(budgetData));
-  }
-
   function toggleTheme() {
     const currentTheme = document.documentElement.getAttribute('data-theme');
     const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
@@ -1400,40 +1383,6 @@
     searchInput.value = '';
     renderTable();
     showStatus('🔍 Filters cleared');
-  });
-
-  copyAIBtn.addEventListener('click', () => {
-    // Optimized: Only copy the data currently visible based on filters
-    const searchTerm = searchInput.value.toLowerCase();
-    const start = filterStartDate.value;
-    const end = filterEndDate.value;
-    const minAmount = parseFloat(filterMinAmount.value) || 0;
-    const maxAmount = parseFloat(filterMaxAmount.value) || Infinity;
-
-    const filteredData = budgetData.filter(row => {
-      const matchesSearch = (
-        (row['Purchased By'] || '').toLowerCase().includes(searchTerm) ||
-        (row['Purchased Store'] || '').toLowerCase().includes(searchTerm) ||
-        (row['Bank Name'] || '').toLowerCase().includes(searchTerm)
-      );
-      const rowDate = row['Date'] || '';
-      const matchesDate = (!start || rowDate >= start) && (!end || rowDate <= end);
-      const rowAmount = Number(row['Amount Total']) || 0;
-      const matchesAmount = rowAmount >= minAmount && rowAmount <= maxAmount;
-      return matchesSearch && matchesDate && matchesAmount;
-    });
-
-    if (filteredData.length === 0) {
-      showStatus('❌ No data to copy', true);
-      return;
-    }
-    const textSummary = filteredData.map(row => 
-      `Date: ${row.Date}, Store: ${row['Purchased Store']}, Amount: $${row['Amount Total']}, By: ${row['Purchased By']}`
-    ).join('\n');
-    
-    navigator.clipboard.writeText(`Here is my spending data:\n${textSummary}`).then(() => {
-      showStatus('📋 Data copied for AI analysis');
-    });
   });
 
   // Chart buttons
@@ -1622,7 +1571,6 @@
       showStatus('✅ Entry added successfully!');
     }
 
-    saveToLocalStorage();
     renderTable();
     resetForm();
   }
@@ -1813,7 +1761,6 @@
   function removeRow(index) {
     if (confirm('🗑️ Are you sure you want to delete this entry?')) {
       budgetData.splice(index, 1);
-      saveToLocalStorage();
       if (editIndex === index) {
         editIndex = -1;
         addBtn.innerHTML = '<i class="fas fa-plus"></i>';
@@ -1831,7 +1778,6 @@
     if (confirm('🗑️ Clear all data? This action cannot be undone.')) {
       budgetData = [];
       comparisonData = [];
-      saveToLocalStorage();
       editIndex = -1;
       addBtn.innerHTML = '<i class="fas fa-plus"></i>';
       addBtn.setAttribute('data-tooltip', 'Add Entry');
@@ -1885,7 +1831,6 @@
         lastUploadData = jsonData;
         budgetData = jsonData;
         comparisonData = [];
-      saveToLocalStorage();
         renderTable();
         showStatus('✅ Excel file uploaded successfully!');
       } catch (error) {
@@ -2405,14 +2350,9 @@
   const initialTheme = 'light';
   document.documentElement.setAttribute('data-theme', initialTheme);
   updateThemeUI(initialTheme);
-  updateGreeting();
   updateDropdowns();
 
-  // Load Data and Config
-  const storedData = localStorage.getItem('spendwise_budget_data');
-  if (storedData) {
-    budgetData = JSON.parse(storedData);
-  }
+  // Load Config
   document.getElementById('apiTokenInput').value = AI_CONFIG.token;
   
   renderTable();
