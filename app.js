@@ -550,6 +550,7 @@
   function resetAllLocalData() {
     if (confirm('Reset all settings (people, banks, budgets, categories, recurring)? Your transaction table is not affected.')) {
       localStorage.removeItem('spendwise_settings');
+      localStorage.removeItem('spendwise_data'); // legacy key from older versions
       populateSettingsUI();
       updateDropdowns();
       populateCategoryDropdown();
@@ -1880,6 +1881,9 @@
   // Transactions are never cached: every visit starts with a blank sheet —
   // upload an Excel file or enter new data. Recurring transactions are only
   // applied when the user presses the Apply Recurring button.
+  // Older versions persisted transactions under this key; remove any leftovers
+  // so devices that ran the old app don't keep stale data around.
+  try { localStorage.removeItem('spendwise_data'); } catch (e) { /* storage unavailable */ }
   applyCurrencySetting();
 
   // Default the date field to today for faster entry
