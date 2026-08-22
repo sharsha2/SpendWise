@@ -18,7 +18,7 @@ global.getSettings = () => ({
   categories: { 'Lawn Care': ['lawn', 'mowing'] }
 });
 
-eval(extract('function toCents', 'function persistData'));                 // toCents, sumCents, escapeHtml
+eval(extract('function toCents', 'function debounce'));                    // toCents, sumCents, escapeHtml
 eval(extract('function getCategoryGroups', '// Manage People'));           // groups, flat map, group lookup
 eval(extract('const keywordRegexCache', 'function getCategoryBadge')
   .replace('const keywordRegexCache', 'var keywordRegexCache'));           // categorizeStore

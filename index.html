@@ -34,7 +34,6 @@
           <i class="fas fa-bars"></i> Menu
         </button>
         <div class="menu-options" id="menuOptions">
-          <div class="menu-option" onclick="showView('dashboard')"><i class="fas fa-columns"></i> Dashboard</div>
           <div class="menu-option" onclick="openReportsHub()"><i class="fas fa-chart-line"></i> Financial Reports</div>
           <div class="menu-option" onclick="openSettingsModal()"><i class="fas fa-cog"></i> Settings</div>
           <div class="menu-option" onclick="openCompareModal()"><i class="fas fa-balance-scale"></i> Compare Months</div>
@@ -240,6 +239,14 @@
     <div class="chart-title">Settings</div>
     
     <div class="dashboard" style="grid-template-columns: 1fr 1fr; gap: 15px;">
+      <div class="section-card" style="padding: 15px; grid-column: span 2;">
+        <div class="section-header" style="font-size: 0.9em;"><i class="fas fa-coins"></i> Currency</div>
+        <select id="currencySelect" onchange="setCurrencySetting(this.value)" style="padding: 8px; width: 100%;" aria-label="Currency">
+          <option value="dollar">$ — Dollar</option>
+          <option value="inr">₹ — Indian Rupee (INR)</option>
+        </select>
+      </div>
+
       <div class="section-card" style="padding: 15px;">
         <div class="section-header" style="font-size: 0.9em;"><i class="fas fa-users"></i> Manage People</div>
         <div style="display: flex; gap: 5px; margin-bottom: 10px;">
@@ -290,7 +297,7 @@
             <option value="D">Debit</option>
             <option value="C">Credit</option>
           </select>
-          <button class="action-btn primary" onclick="addRecurringSetting()" style="height: 35px; width: 100%;"><i class="fas fa-plus"></i> Add</button>
+          <button class="action-btn primary" aria-label="Add recurring transaction" onclick="addRecurringSetting()" style="height: 35px; width: 100%;"><i class="fas fa-plus"></i></button>
         </div>
         <div id="recurringList" style="max-height: 200px; overflow-y: auto; font-size: 13px;"></div>
       </div>

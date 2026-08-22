@@ -1,11 +1,26 @@
   let budgetData = [];
   let inlineEditIndex = -1;
 
-  const DATA_KEY = 'spendwise_data';
-  const fmtCurrency = new Intl.NumberFormat(undefined, { style: 'currency', currency: 'USD' });
+  // Currency display: a generic dollar sign by default, with INR as an option.
+  const CURRENCIES = {
+    dollar: { symbol: '$', locale: undefined },
+    inr: { symbol: '₹', locale: 'en-IN' }
+  };
+
+  let activeCurrency = CURRENCIES.dollar;
+  let fmtNumber = new Intl.NumberFormat(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+  function applyCurrencySetting() {
+    activeCurrency = CURRENCIES[getSettings().currency] || CURRENCIES.dollar;
+    fmtNumber = new Intl.NumberFormat(activeCurrency.locale, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    document.getElementById('filterMinAmount').placeholder = `Min ${activeCurrency.symbol}`;
+    document.getElementById('filterMaxAmount').placeholder = `Max ${activeCurrency.symbol}`;
+    document.getElementById('budgetAmount').placeholder = `Limit ${activeCurrency.symbol}`;
+  }
 
   function fmtMoney(v) {
-    return fmtCurrency.format(Number(v) || 0);
+    const n = Number(v) || 0;
+    return (n < 0 ? '-' : '') + activeCurrency.symbol + fmtNumber.format(Math.abs(n));
   }
 
   // Money is summed in integer cents to avoid floating-point drift
@@ -30,16 +45,6 @@
     };
   }
 
-  function persistData() {
-    try { localStorage.setItem(DATA_KEY, JSON.stringify(budgetData)); } catch (e) { /* storage unavailable or full */ }
-  }
-
-  function loadPersistedData() {
-    try {
-      const stored = JSON.parse(localStorage.getItem(DATA_KEY));
-      if (Array.isArray(stored)) budgetData = stored;
-    } catch (e) { /* corrupted saved data — start fresh */ }
-  }
   let incomeExpenseChart = null;
   let spendingCategoryChart = null;
   let monthlyOverviewChart = null;
@@ -48,15 +53,190 @@
   let compareMonthsChart = null;
   let currentSort = { column: null, direction: 'none' }; // none, asc, desc
 
-  // Chart Color Palette
-  const chartColors = {
-    income: '#059669',   // Emerald 600
-    expense: '#EF4444',  // Red 500
-    primary: '#0D9488',  // Teal 600
-    palette: [
-      '#0D9488', '#6366F1', '#F59E0B', '#F43F5E', '#8B5CF6', /* Teal, Indigo, Amber, Rose, Violet */
-      '#06B6D4', '#10B981', '#D946EF', '#F97316', '#64748B' /* Cyan, Emerald, Fuchsia, Orange, Slate */
-    ]
+  // Chart colors, validated for colorblind safety against both app surfaces
+  // (#FFFFFF light / #172033 dark). The categorical slots are assigned in this
+  // fixed order and never cycled — extra categories fold into "Other".
+  const CHART_PALETTE = {
+    light: ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#4a3aa7', '#e34948'],
+    dark:  ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9', '#e66767']
+  };
+
+  function chartTheme() {
+    const dark = document.documentElement.getAttribute('data-theme') === 'dark';
+    const css = getComputedStyle(document.documentElement);
+    const v = name => css.getPropertyValue(name).trim();
+    return {
+      dark,
+      surface: v('--card-bg') || (dark ? '#172033' : '#FFFFFF'),
+      ink: v('--text-color') || (dark ? '#CBD5E1' : '#334155'),
+      muted: v('--muted-color') || '#64748B',
+      grid: dark ? 'rgba(148, 163, 184, 0.15)' : 'rgba(100, 116, 139, 0.15)',
+      income: '#059669',
+      expense: '#EF4444',
+      net: dark ? '#3987e5' : '#2a78d6',
+      other: dark ? '#94A3B8' : '#64748B',
+      palette: dark ? CHART_PALETTE.dark : CHART_PALETTE.light,
+      fontFamily: "'Inter', system-ui, -apple-system, sans-serif"
+    };
+  }
+
+  // Compact money for axis ticks ($1.2K) — full values stay in tooltips
+  function fmtMoneyShort(v) {
+    const n = Number(v) || 0;
+    const abs = Math.abs(n);
+    let s;
+    if (abs >= 1e6) s = (abs / 1e6).toFixed(1).replace(/\.0$/, '') + 'M';
+    else if (abs >= 1e3) s = (abs / 1e3).toFixed(1).replace(/\.0$/, '') + 'K';
+    else s = Number.isInteger(abs) ? String(abs) : fmtNumber.format(abs);
+    return (n < 0 ? '-' : '') + activeCurrency.symbol + s;
+  }
+
+  function withAlpha(hex, alpha) {
+    const n = parseInt(hex.slice(1), 16);
+    return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
+  }
+
+  function chartTitle(theme, text) {
+    return {
+      display: true,
+      text,
+      color: theme.ink,
+      font: { family: theme.fontFamily, size: 15, weight: '600' },
+      padding: { bottom: 4 }
+    };
+  }
+
+  function chartSubtitle(theme, text) {
+    return {
+      display: true,
+      text,
+      color: theme.muted,
+      font: { family: theme.fontFamily, size: 12 },
+      padding: { bottom: 14 }
+    };
+  }
+
+  function chartLegend(theme, display = true) {
+    return {
+      display,
+      position: 'bottom',
+      labels: {
+        color: theme.ink,
+        usePointStyle: true,
+        pointStyle: 'circle',
+        boxWidth: 8,
+        boxHeight: 8,
+        padding: 14,
+        font: { family: theme.fontFamily, size: 13 },
+        sort: (a, b) => a.datasetIndex - b.datasetIndex
+      }
+    };
+  }
+
+  function chartTooltip(theme, callbacks) {
+    return {
+      backgroundColor: theme.dark ? '#0B1220' : '#1E293B',
+      titleColor: '#F8FAFC',
+      bodyColor: '#E2E8F0',
+      padding: 10,
+      cornerRadius: 8,
+      boxPadding: 4,
+      usePointStyle: true,
+      titleFont: { family: theme.fontFamily, size: 12, weight: '600' },
+      bodyFont: { family: theme.fontFamily, size: 12 },
+      callbacks
+    };
+  }
+
+  // Doughnut slices: "Groceries: $412.50 (32.1%)"
+  const sliceLabel = (context) => {
+    const total = context.dataset.data.reduce((a, b) => a + b, 0);
+    const pct = total ? ((context.raw / total) * 100).toFixed(1) : '0.0';
+    return `${context.label || ''}: ${fmtMoney(context.raw)} (${pct}%)`;
+  };
+
+  // Single-series bars (tooltip title already names the bar): "$412.50 (32.1%)"
+  const shareLabel = (context) => {
+    const total = context.dataset.data.reduce((a, b) => a + b, 0);
+    const pct = total ? ((context.raw / total) * 100).toFixed(1) : '0.0';
+    return `${fmtMoney(context.raw)} (${pct}% of total)`;
+  };
+
+  // Value axis: hairline grid, muted compact-money ticks
+  function moneyAxis(theme) {
+    return {
+      beginAtZero: true,
+      grid: { color: theme.grid, drawTicks: false },
+      border: { display: false },
+      ticks: {
+        color: theme.muted,
+        font: { family: theme.fontFamily, size: 12 },
+        callback: value => fmtMoneyShort(value),
+        padding: 6,
+        maxTicksLimit: 6
+      }
+    };
+  }
+
+  // Category axis: no grid, muted labels
+  function labelAxis(theme) {
+    return {
+      grid: { display: false },
+      border: { display: false },
+      ticks: { color: theme.muted, font: { family: theme.fontFamily, size: 12 } }
+    };
+  }
+
+  // Direct value labels at the tips of single-series bars (the money axis is
+  // hidden on those charts — the labels carry the values instead)
+  const barValuePlugin = {
+    id: 'barValues',
+    afterDatasetsDraw(chart) {
+      const opts = chart.options.plugins.barValues;
+      if (!opts || !opts.display) return;
+      const horizontal = chart.options.indexAxis === 'y';
+      const meta = chart.getDatasetMeta(0);
+      const { ctx } = chart;
+      ctx.save();
+      ctx.fillStyle = opts.color;
+      ctx.font = `600 12px ${opts.fontFamily}`;
+      meta.data.forEach((bar, i) => {
+        const label = fmtMoneyShort(chart.data.datasets[0].data[i]);
+        if (horizontal) {
+          ctx.textAlign = 'left';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(label, bar.x + 8, bar.y);
+        } else {
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'bottom';
+          ctx.fillText(label, bar.x, bar.y - 6);
+        }
+      });
+      ctx.restore();
+    }
+  };
+
+  // Draws a headline value in the hole of a doughnut chart
+  const centerTextPlugin = {
+    id: 'centerText',
+    afterDatasetsDraw(chart) {
+      const opts = chart.options.plugins.centerText;
+      if (!opts || !opts.value) return;
+      const meta = chart.getDatasetMeta(0);
+      if (!meta.data.length) return;
+      const { x, y } = meta.data[0];
+      const { ctx } = chart;
+      ctx.save();
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font = `700 20px ${opts.fontFamily}`;
+      ctx.fillStyle = opts.color;
+      ctx.fillText(opts.value, x, y - 8);
+      ctx.font = `500 12px ${opts.fontFamily}`;
+      ctx.fillStyle = opts.mutedColor;
+      ctx.fillText(opts.label, x, y + 14);
+      ctx.restore();
+    }
   };
 
   // Menu Logic
@@ -84,14 +264,6 @@
       if (inlineEditIndex > -1) cancelInlineEdit();
     }
   });
-
-  function showView(viewId) {
-    if(viewId === 'dashboard') {
-      document.getElementById('dashboardView').classList.add('active');
-    }
-    menuOptions.classList.remove('show');
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  }
 
   function openReportsHub() {
     document.getElementById('reportsHubModal').style.display = 'flex';
@@ -198,7 +370,8 @@
       banks: ['Scotia Debit', 'Scotia Credit', 'Amex', 'PC', 'Wealthsimple', 'Simplii'],
       budgets: {}, // { "Groceries": 600 }
       recurring: [], // [ {desc, amount, day, payer, bank, type} ]
-      categories: {} // { "Pets": ["vet", "petsmart"] }
+      categories: {}, // { "Pets": ["vet", "petsmart"] }
+      currency: 'dollar' // 'dollar' (generic $) or 'inr' (₹)
     };
     const stored = localStorage.getItem('spendwise_settings');
     return stored ? JSON.parse(stored) : defaultSettings;
@@ -206,6 +379,15 @@
 
   function saveSettings(settings) {
     localStorage.setItem('spendwise_settings', JSON.stringify(settings));
+  }
+
+  function setCurrencySetting(code) {
+    const settings = getSettings();
+    settings.currency = code;
+    saveSettings(settings);
+    applyCurrencySetting();
+    renderTable();
+    populateSettingsUI();
   }
 
   function addSettingItem(key, inputId) {
@@ -328,6 +510,8 @@
     // Sync dropdowns in recurring form
     document.getElementById('recPayer').innerHTML = settings.people.map(p => `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`).join('');
     document.getElementById('recBank').innerHTML = settings.banks.map(b => `<option value="${escapeHtml(b)}">${escapeHtml(b)}</option>`).join('');
+
+    document.getElementById('currencySelect').value = CURRENCIES[settings.currency] ? settings.currency : 'dollar';
   }
 
   function removeBudgetByIndex(index) {
@@ -496,15 +680,10 @@
   [filterStartDate, filterEndDate].forEach(el =>
     el.addEventListener('input', () => { datePreset.value = 'custom'; }));
 
-  function applyRecurringTransactions(auto = false) {
-    // After a manual clear/fresh start, auto-apply stays off for the rest of
-    // the month so cleared recurring entries don't resurrect on reload.
-    const monthKey = todayStr().slice(0, 7);
-    if (auto && localStorage.getItem('spendwise_skip_recurring') === monthKey) return;
-
+  function applyRecurringTransactions() {
     const settings = getSettings();
     if (settings.recurring.length === 0) {
-      if (!auto) showStatus('⚠️ No recurring transactions defined in Settings.', true);
+      showStatus('⚠️ No recurring transactions defined in Settings.', true);
       return;
     }
 
@@ -537,21 +716,15 @@
     });
 
     if (count === 0) {
-      if (!auto) showStatus('ℹ️ All recurring transactions were already applied this month.');
+      showStatus('ℹ️ All recurring transactions were already applied this month.');
       return;
     }
 
     renderTable();
-    showStatus(auto
-      ? `🔁 Auto-applied ${count} recurring transaction${count > 1 ? 's' : ''} for this month.`
-      : `✅ Applied ${count} recurring transaction${count > 1 ? 's' : ''}${skipped ? ` (${skipped} already present)` : ''}.`);
+    showStatus(`✅ Applied ${count} recurring transaction${count > 1 ? 's' : ''}${skipped ? ` (${skipped} already present)` : ''}.`);
   }
 
-  applyRecurringBtn.addEventListener('click', () => {
-    // Explicitly applying re-enables the monthly auto-apply
-    localStorage.removeItem('spendwise_skip_recurring');
-    applyRecurringTransactions(false);
-  });
+  applyRecurringBtn.addEventListener('click', () => applyRecurringTransactions());
 
   // Charts open only when there is data to draw (respecting active filters)
   function openChart(updateFn, modal) {
@@ -914,8 +1087,6 @@
   }
 
   function renderTable() {
-    persistData();
-
     const tbody = document.querySelector('#budgetTable tbody');
     tbody.innerHTML = '';
 
@@ -1132,15 +1303,10 @@
     });
   }
 
-  function suppressRecurringThisMonth() {
-    try { localStorage.setItem('spendwise_skip_recurring', todayStr().slice(0, 7)); } catch (e) { /* best effort */ }
-  }
-
   function clearTable() {
     if (confirm('🗑️ Clear all data? This action cannot be undone.')) {
       budgetData = [];
       inlineEditIndex = -1;
-      suppressRecurringThisMonth();
       renderTable();
       showStatus('✅ All data cleared!');
     }
@@ -1318,29 +1484,46 @@
     const incomeData = sortedKeys.map(k => aggregatedData[k].income);
     const expensesData = sortedKeys.map(k => aggregatedData[k].expenses);
 
+    const theme = chartTheme();
+
     compareMonthsChart = new Chart(ctx, {
       type: 'bar',
       data: {
         labels: labels,
         datasets: [
-          { label: 'Income', data: incomeData, backgroundColor: chartColors.income, borderRadius: 6 },
-          { label: 'Expenses', data: expensesData, backgroundColor: chartColors.expense, borderRadius: 6 }
+          {
+            label: 'Income',
+            data: incomeData,
+            backgroundColor: theme.income,
+            borderRadius: 4,
+            maxBarThickness: 24,
+            barPercentage: 0.8,
+            categoryPercentage: 0.6
+          },
+          {
+            label: 'Expenses',
+            data: expensesData,
+            backgroundColor: theme.expense,
+            borderRadius: 4,
+            maxBarThickness: 24,
+            barPercentage: 0.8,
+            categoryPercentage: 0.6
+          }
         ]
       },
       options: {
         responsive: true,
         maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
         plugins: {
-          legend: { position: 'bottom' },
-          tooltip: {
-            callbacks: {
-              label: (context) => `${context.dataset.label}: ${fmtMoney(context.raw)}`
-            }
-          }
+          legend: chartLegend(theme),
+          tooltip: chartTooltip(theme, {
+            label: context => `${context.dataset.label}: ${fmtMoney(context.raw)}`
+          })
         },
         scales: {
-          y: { beginAtZero: true, grid: { display: false } },
-          x: { grid: { display: false } }
+          x: labelAxis(theme),
+          y: moneyAxis(theme)
         }
       }
     });
@@ -1369,47 +1552,37 @@
     const data = getFilteredData();
     const totalDebit = sumCents(data, 'Debit [D]') / 100;
     const totalCredit = sumCents(data, 'Credit [C]') / 100;
-    
+    const theme = chartTheme();
+
     incomeExpenseChart = new Chart(ctx, {
       type: 'doughnut',
+      plugins: [centerTextPlugin],
       data: {
         labels: ['Expenses', 'Income'],
         datasets: [{
           data: [totalDebit, totalCredit],
-          backgroundColor: [chartColors.expense, chartColors.income],
-          borderWidth: 0,
-          hoverOffset: 15
+          backgroundColor: [theme.expense, theme.income],
+          borderColor: theme.surface,
+          borderWidth: 2,
+          hoverBorderColor: theme.surface,
+          hoverOffset: 8
         }]
       },
       options: {
-        cutout: '70%',
+        cutout: '72%',
         responsive: true,
         maintainAspectRatio: false,
+        layout: { padding: 8 },
         plugins: {
-          title: {
-            display: true,
-            text: 'Total Cashflow Summary',
-            font: {
-              size: 16,
-              weight: 'bold'
-            }
-          },
-          legend: {
-            position: 'bottom',
-            labels: {
-              font: {
-                size: 14
-              }
-            }
-          },
-          tooltip: {
-            callbacks: {
-              label: function(context) {
-                const total = context.dataset.data.reduce((a, b) => a + b, 0);
-                const pct = total ? ((context.raw / total) * 100).toFixed(1) : '0.0';
-                return `${context.label || ''}: ${fmtMoney(context.raw)} (${pct}%)`;
-              }
-            }
+          title: chartTitle(theme, 'Total Cashflow Summary'),
+          legend: chartLegend(theme),
+          tooltip: chartTooltip(theme, { label: sliceLabel }),
+          centerText: {
+            value: fmtMoney(totalCredit - totalDebit),
+            label: 'Net Balance',
+            color: theme.ink,
+            mutedColor: theme.muted,
+            fontFamily: theme.fontFamily
           }
         }
       }
@@ -1431,55 +1604,48 @@
       }
     });
 
-    // Show the top slices only and group the tail so the doughnut stays readable
+    // Show the top slices only and group the tail so the doughnut stays
+    // readable — 7 + "Other" keeps every hue inside the validated palette
     const catEntries = Object.entries(categoriesC).sort((a, b) => b[1] - a[1]);
-    const topSlices = catEntries.slice(0, 9);
-    const restSlices = catEntries.slice(9);
+    const topSlices = catEntries.slice(0, 7);
+    const restSlices = catEntries.slice(7);
     if (restSlices.length) {
       topSlices.push([`Other (${restSlices.length} more)`, restSlices.reduce((s, [, v]) => s + v, 0)]);
     }
-    const sortedCategories = Object.fromEntries(topSlices.map(([k, v]) => [k, v / 100]));
-    
+    const theme = chartTheme();
+    const sliceColors = topSlices.map(([, ], i) =>
+      (restSlices.length && i === topSlices.length - 1) ? theme.other : theme.palette[i]);
+    const totalSpentC = catEntries.reduce((s, [, v]) => s + v, 0);
+
     spendingCategoryChart = new Chart(ctx, {
       type: 'doughnut',
+      plugins: [centerTextPlugin],
       data: {
-        labels: Object.keys(sortedCategories),
+        labels: topSlices.map(([k]) => k),
         datasets: [{
-          data: Object.values(sortedCategories),
-          backgroundColor: chartColors.palette,
-          borderWidth: 0,
-          hoverOffset: 15
+          data: topSlices.map(([, v]) => v / 100),
+          backgroundColor: sliceColors,
+          borderColor: theme.surface,
+          borderWidth: 2,
+          hoverBorderColor: theme.surface,
+          hoverOffset: 8
         }]
       },
       options: {
-        cutout: '70%',
+        cutout: '72%',
         responsive: true,
         maintainAspectRatio: false,
+        layout: { padding: 8 },
         plugins: {
-          title: {
-            display: true,
-            text: 'Expenditure Breakdown',
-            font: {
-              size: 16,
-              weight: 'bold'
-            }
-          },
-          legend: {
-            position: 'bottom',
-            labels: {
-              font: {
-                size: 14
-              }
-            }
-          },
-          tooltip: {
-            callbacks: {
-              label: function(context) {
-                const total = context.dataset.data.reduce((a, b) => a + b, 0);
-                const pct = total ? ((context.raw / total) * 100).toFixed(1) : '0.0';
-                return `${context.label || ''}: ${fmtMoney(context.raw)} (${pct}%)`;
-              }
-            }
+          title: chartTitle(theme, 'Expenditure Breakdown'),
+          legend: chartLegend(theme),
+          tooltip: chartTooltip(theme, { label: sliceLabel }),
+          centerText: {
+            value: fmtMoney(totalSpentC / 100),
+            label: 'Total Spent',
+            color: theme.ink,
+            mutedColor: theme.muted,
+            fontFamily: theme.fontFamily
           }
         }
       }
@@ -1529,6 +1695,8 @@
     const expensesData = sortedKeys.map(k => monthlyData[k].expensesC / 100);
     const netData = sortedKeys.map(k => (monthlyData[k].incomeC - monthlyData[k].expensesC) / 100);
     
+    const theme = chartTheme();
+
     monthlyOverviewChart = new Chart(ctx, {
       type: 'bar',
       data: {
@@ -1537,27 +1705,38 @@
           {
             label: 'Income',
             data: incomeData,
-            backgroundColor: chartColors.income,
-            borderRadius: 6,
-            barPercentage: 0.6,
-            categoryPercentage: 0.5
+            backgroundColor: theme.income,
+            borderRadius: 4,
+            maxBarThickness: 24,
+            barPercentage: 0.95,
+            categoryPercentage: 0.5,
+            order: 2
           },
           {
             label: 'Expenses',
             data: expensesData,
-            backgroundColor: chartColors.expense,
-            borderRadius: 6,
-            barPercentage: 0.6,
-            categoryPercentage: 0.5
+            backgroundColor: theme.expense,
+            borderRadius: 4,
+            maxBarThickness: 24,
+            barPercentage: 0.95,
+            categoryPercentage: 0.5,
+            order: 2
           },
           {
             type: 'line',
             label: 'Net Savings',
             data: netData,
-            borderColor: chartColors.primary,
-            backgroundColor: chartColors.primary,
-            tension: 0.3,
-            pointRadius: 3
+            borderColor: theme.net,
+            backgroundColor: withAlpha(theme.net, 0.08),
+            fill: 'origin',
+            borderWidth: 2,
+            tension: 0.35,
+            pointRadius: 4,
+            pointHoverRadius: 6,
+            pointBackgroundColor: theme.net,
+            pointBorderColor: theme.surface,
+            pointBorderWidth: 2,
+            order: 1
           }
         ]
       },
@@ -1565,51 +1744,18 @@
         indexAxis: 'x',
         responsive: true,
         maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
         plugins: {
-          title: {
-            display: true,
-            text: 'Monthly Financial Trends',
-            font: {
-              size: 16,
-              weight: 'bold'
-            }
-          },
-          legend: {
-            position: 'bottom',
-            labels: {
-              font: {
-                size: 14
-              }
-            }
-          },
-          tooltip: {
-            callbacks: {
-              label: function(context) {
-                let label = context.dataset.label || '';
-                if (label) {
-                  label += ': ';
-                }
-                label += fmtMoney(context.raw);
-                return label;
-              }
-            }
-          }
+          title: chartTitle(theme, 'Monthly Financial Trends'),
+          subtitle: chartSubtitle(theme, labels.length > 1 ? `${labels[0]} — ${labels[labels.length - 1]}` : labels[0] || ''),
+          legend: chartLegend(theme),
+          tooltip: chartTooltip(theme, {
+            label: context => `${context.dataset.label}: ${fmtMoney(context.raw)}`
+          })
         },
         scales: {
-          x: {
-            beginAtZero: true,
-            grid: { display: false },
-            title: {
-              display: true,
-              text: 'Month',
-              font: { weight: 'bold' }
-            }
-          },
-          y: {
-            beginAtZero: true,
-            grid: { display: false },
-            ticks: { font: { weight: 'bold' } }
-          }
+          x: labelAxis(theme),
+          y: moneyAxis(theme)
         }
       }
     });
@@ -1633,47 +1779,37 @@
     const sortedBanks = Object.fromEntries(
       Object.entries(bankData).sort((a, b) => b[1] - a[1]).map(([k, v]) => [k, v / 100]));
     
+    const theme = chartTheme();
+
     creditCardSpendingChart = new Chart(ctx, {
       type: 'bar',
+      plugins: [barValuePlugin],
       data: {
         labels: Object.keys(sortedBanks),
         datasets: [{
-          label: 'Spending Amount ($)',
+          label: 'Spending',
           data: Object.values(sortedBanks),
-          backgroundColor: chartColors.palette,
-          borderRadius: 8
+          backgroundColor: theme.net,
+          borderRadius: 4,
+          maxBarThickness: 24
         }]
       },
       options: {
         indexAxis: 'y', // Better for reading bank names
         responsive: true,
         maintainAspectRatio: false,
+        layout: { padding: { right: 56 } }, // room for the tip labels
         plugins: {
-          title: {
-            display: true,
-            text: 'Spending by Bank/Account',
-            font: {
-              size: 16,
-              weight: 'bold'
-            }
-          },
-          legend: {
-            position: 'bottom',
-            labels: {
-              font: {
-                size: 14
-              }
-            }
-          },
-          tooltip: {
-            callbacks: {
-              label: function(context) {
-                const total = context.dataset.data.reduce((a, b) => a + b, 0);
-                const pct = total ? ((context.raw / total) * 100).toFixed(1) : '0.0';
-                return `${context.label || ''}: ${fmtMoney(context.raw)} (${pct}%)`;
-              }
-            }
-          }
+          title: chartTitle(theme, 'Spending by Bank/Account'),
+          subtitle: chartSubtitle(theme, 'Total spent per account'),
+          legend: chartLegend(theme, false), // single series — the title says it all
+          tooltip: chartTooltip(theme, { label: shareLabel }),
+          barValues: { display: true, color: theme.ink, fontFamily: theme.fontFamily }
+        },
+        scales: {
+          // every bar carries its value, so the money axis would be noise
+          x: { display: false, beginAtZero: true },
+          y: labelAxis(theme)
         }
       }
     });
@@ -1697,46 +1833,36 @@
     const sortedPersons = Object.fromEntries(
       Object.entries(personData).sort((a, b) => b[1] - a[1]).map(([k, v]) => [k, v / 100]));
     
+    const theme = chartTheme();
+
     purchasedByTrendChart = new Chart(ctx, {
       type: 'bar',
+      plugins: [barValuePlugin],
       data: {
         labels: Object.keys(sortedPersons),
         datasets: [{
-          label: 'Total Spent ($)',
+          label: 'Total Spent',
           data: Object.values(sortedPersons),
-          backgroundColor: chartColors.palette,
-          borderRadius: 8
+          backgroundColor: theme.net,
+          borderRadius: 4,
+          maxBarThickness: 24
         }]
       },
       options: {
         responsive: true,
         maintainAspectRatio: false,
+        layout: { padding: { top: 24 } }, // room for the tip labels
         plugins: {
-          title: {
-            display: true,
-            text: 'Spending Distribution by Person',
-            font: {
-              size: 16,
-              weight: 'bold'
-            }
-          },
-          legend: {
-            position: 'bottom',
-            labels: {
-              font: {
-                size: 14
-              }
-            }
-          },
-          tooltip: {
-            callbacks: {
-              label: function(context) {
-                const total = context.dataset.data.reduce((a, b) => a + b, 0);
-                const pct = total ? ((context.raw / total) * 100).toFixed(1) : '0.0';
-                return `${context.label || ''}: ${fmtMoney(context.raw)} (${pct}%)`;
-              }
-            }
-          }
+          title: chartTitle(theme, 'Spending Distribution by Person'),
+          subtitle: chartSubtitle(theme, 'Total spent per person'),
+          legend: chartLegend(theme, false), // single series — the title says it all
+          tooltip: chartTooltip(theme, { label: shareLabel }),
+          barValues: { display: true, color: theme.ink, fontFamily: theme.fontFamily }
+        },
+        scales: {
+          // every bar carries its value, so the money axis would be noise
+          x: labelAxis(theme),
+          y: { display: false, beginAtZero: true }
         }
       }
     });
@@ -1751,11 +1877,10 @@
   updateDropdowns();
   populateCategoryDropdown();
 
-  // Restore transactions saved from previous visits
-  loadPersistedData();
-
-  // Recurring transactions apply themselves once per month (duplicate-safe)
-  applyRecurringTransactions(true);
+  // Transactions are never cached: every visit starts with a blank sheet —
+  // upload an Excel file or enter new data. Recurring transactions are only
+  // applied when the user presses the Apply Recurring button.
+  applyCurrencySetting();
 
   // Default the date field to today for faster entry
   document.getElementById('date').value = todayStr();
@@ -1920,7 +2045,6 @@
     const snapshot = budgetData;
     budgetData = [];
     inlineEditIndex = -1;
-    suppressRecurringThisMonth();
 
     // Reset every filter too, so the new session is truly blank
     filterStartDate.value = '';
@@ -1934,7 +2058,6 @@
     window.scrollTo({ top: 0, behavior: 'smooth' });
     showStatus('✨ Fresh start — all transactions cleared.', false, () => {
       budgetData = snapshot;
-      localStorage.removeItem('spendwise_skip_recurring');
       renderTable();
       showStatus('↩️ Transactions restored.');
     });
