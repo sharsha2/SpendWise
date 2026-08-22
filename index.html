@@ -49,9 +49,9 @@
   <section class="section-card">
     <div class="section-header"><i class="fas fa-wallet"></i> Financial Summary</div>
     <div class="totals">
-      <div class="pill"><span class="label">Total Expenses</span><span class="value" id="totalDebit">$0.00</span></div>
-      <div class="pill"><span class="label">Total Income</span><span class="value" id="totalCredit">$0.00</span></div>
-      <div class="pill"><span class="label">Net Balance</span><span class="value" id="netTotal">$0.00</span></div>
+      <div class="pill"><span class="label"><i class="fas fa-arrow-trend-down"></i> Total Expenses</span><span class="value value-expense" id="totalDebit">$0.00</span></div>
+      <div class="pill"><span class="label"><i class="fas fa-arrow-trend-up"></i> Total Income</span><span class="value value-income" id="totalCredit">$0.00</span></div>
+      <div class="pill"><span class="label"><i class="fas fa-scale-balanced"></i> Net Balance</span><span class="value" id="netTotal">$0.00</span></div>
     </div>
     <div id="budgetTrackingSection" style="display: none; border-top: 1px solid var(--border-color); margin-top: 20px; padding-top: 15px;">
       <div class="section-header" style="font-size: 0.9em; margin-bottom: 10px;"><i class="fas fa-bullseye"></i> Monthly Budget Tracking <span id="budgetMonthLabel" style="font-weight: 500; color: var(--muted-color);"></span></div>
@@ -92,7 +92,7 @@
         <label><div>Amount</div><input type="number" id="amount" placeholder="0.00" step="0.01" min="0" inputmode="decimal"></label>
       </div>
       <div class="bar">
-        <button class="action-btn primary" id="addBtn" data-tooltip="Add Entry"><i class="fas fa-plus"></i></button>
+        <button class="add-entry-btn primary" id="addBtn"><i class="fas fa-plus"></i> Add Entry</button>
         <button class="action-btn primary" id="applyRecurringBtn" data-tooltip="Apply Recurring Transactions"><i class="fas fa-redo"></i></button>
         <button class="action-btn ghost" id="resetFormBtn" data-tooltip="Clear Form"><i class="fas fa-eraser"></i></button>
         <button class="action-btn ghost" id="downloadBtn" data-tooltip="Download Excel"><i class="fas fa-download"></i></button>
@@ -108,7 +108,7 @@
     <!-- Integrated Transaction History -->
     <section class="section-card table-section">
       <div class="table-header">
-        <div class="section-header" style="margin-bottom: 0;"><i class="fas fa-list"></i> Transaction History</div>
+        <div class="section-header" style="margin-bottom: 0;"><i class="fas fa-list"></i> Transaction History <span id="rowCount" class="row-count"></span></div>
         <div class="filter-group">
           <button class="action-btn ghost" id="clearFilterBtn" data-tooltip="Clear Filters">
             <i class="fas fa-filter-circle-xmark"></i>

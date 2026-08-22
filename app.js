@@ -22,6 +22,14 @@
     return String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   }
 
+  function debounce(fn, ms) {
+    let timer;
+    return (...args) => {
+      clearTimeout(timer);
+      timer = setTimeout(() => fn(...args), ms);
+    };
+  }
+
   function persistData() {
     try { localStorage.setItem(DATA_KEY, JSON.stringify(budgetData)); } catch (e) { /* storage unavailable or full */ }
   }
@@ -405,14 +413,13 @@
   const compareFilesInput = document.getElementById('compareFilesInput');
   const statusMessage = document.getElementById('statusMessage');
   
-  searchInput.addEventListener('input', () => {
-    renderTable();
-  });
-
+  // Typing filters re-render after a short pause instead of on every keystroke
+  const debouncedRender = debounce(() => renderTable(), 200);
+  searchInput.addEventListener('input', debouncedRender);
+  filterMinAmount.addEventListener('input', debouncedRender);
+  filterMaxAmount.addEventListener('input', debouncedRender);
   filterStartDate.addEventListener('change', renderTable);
   filterEndDate.addEventListener('change', renderTable);
-  filterMinAmount.addEventListener('input', renderTable);
-  filterMaxAmount.addEventListener('input', renderTable);
   
   resetFormBtn.addEventListener('click', () => {
     resetForm();
@@ -911,8 +918,15 @@
     const filtersActive = searchInput.value !== '' || filterStartDate.value || filterEndDate.value ||
       filterMinAmount.value !== '' || filterMaxAmount.value !== '';
 
+    document.getElementById('rowCount').textContent =
+      filtersActive ? `(${filteredData.length} of ${budgetData.length})` : `(${budgetData.length})`;
+
     if (filteredData.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="8" class="center">${filtersActive ? 'No transactions match your filters.' : 'No transactions yet. Add one above or upload an Excel file.'}</td></tr>`;
+      tbody.innerHTML = `<tr class="empty-row"><td colspan="8"><div class="empty-state">
+        <i class="fas ${filtersActive ? 'fa-filter-circle-xmark' : 'fa-receipt'}"></i>
+        <div class="empty-title">${filtersActive ? 'No matching transactions' : 'No transactions yet'}</div>
+        <div class="empty-hint">${filtersActive ? 'Try adjusting or clearing your filters.' : 'Add your first entry above, or upload an Excel file to get started.'}</div>
+      </div></td></tr>`;
       updateTotals();
       renderBudgetTracking();
       return;
@@ -1321,10 +1335,14 @@
   function updateTotals() {
     const totalDebitC = sumCents(budgetData, 'Debit [D]');
     const totalCreditC = sumCents(budgetData, 'Credit [C]');
+    const net = (totalCreditC - totalDebitC) / 100;
 
     document.getElementById('totalDebit').textContent = fmtMoney(totalDebitC / 100);
     document.getElementById('totalCredit').textContent = fmtMoney(totalCreditC / 100);
-    document.getElementById('netTotal').textContent = fmtMoney((totalCreditC - totalDebitC) / 100);
+    const netEl = document.getElementById('netTotal');
+    netEl.textContent = fmtMoney(net);
+    netEl.classList.toggle('pos', net >= 0);
+    netEl.classList.toggle('neg', net < 0);
   }
 
   function updateIncomeExpenseChart() {
@@ -1769,6 +1787,74 @@
     }
 
     closeCategoryPickers();
+  });
+
+  // Keyboard navigation inside category pickers: arrows move through visible
+  // rows, Right/Left expand/collapse groups, Home/End jump, Enter selects.
+  function pickerFocusables(panel) {
+    return [...panel.querySelectorAll('.cat-option, .cat-group')].filter(el =>
+      el.style.display !== 'none' && !el.closest('.cat-subs[hidden]'));
+  }
+
+  document.addEventListener('keydown', (e) => {
+    const pickerBtn = e.target.closest && e.target.closest('.category-picker-btn');
+    if (pickerBtn && e.key === 'ArrowDown') {
+      e.preventDefault();
+      const wrap = pickerBtn.closest('.cat-wrap');
+      const panel = wrap.querySelector('.category-picker-panel');
+      if (panel.hidden) openCategoryPanel(wrap);
+      const first = pickerFocusables(panel)[0];
+      if (first) first.focus();
+      return;
+    }
+
+    const panel = e.target.closest && e.target.closest('.category-picker-panel');
+    if (!panel || panel.hidden) return;
+
+    const items = pickerFocusables(panel);
+    const idx = items.indexOf(document.activeElement);
+
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (items.length) (items[idx + 1] || items[items.length - 1]).focus();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (idx <= 0) {
+        const search = panel.querySelector('.cat-search input');
+        if (search) search.focus();
+      } else {
+        items[idx - 1].focus();
+      }
+    } else if (e.key === 'ArrowRight' && document.activeElement.classList.contains('cat-group')) {
+      e.preventDefault();
+      const subs = document.activeElement.nextElementSibling;
+      if (subs.hidden) {
+        subs.hidden = false;
+        document.activeElement.classList.add('open');
+      }
+    } else if (e.key === 'ArrowLeft') {
+      const active = document.activeElement;
+      if (active.classList.contains('cat-group') && !active.nextElementSibling.hidden) {
+        e.preventDefault();
+        active.nextElementSibling.hidden = true;
+        active.classList.remove('open');
+      } else {
+        const subs = active.closest('.cat-subs');
+        if (subs) {
+          e.preventDefault();
+          const groupBtn = subs.previousElementSibling;
+          subs.hidden = true;
+          groupBtn.classList.remove('open');
+          groupBtn.focus();
+        }
+      }
+    } else if (e.key === 'Home' && items.length) {
+      e.preventDefault();
+      items[0].focus();
+    } else if (e.key === 'End' && items.length) {
+      e.preventDefault();
+      items[items.length - 1].focus();
+    }
   });
 
   // Type to filter categories: matching groups auto-expand, the rest hide

@@ -1,4 +1,5 @@
     :root {
+      color-scheme: light; /* native menus, selects, and date pickers match the theme */
       --gap: 12px;
       --primary-color: #0D9488;  /* Teal 600 */
       --primary-strong: #0F766E; /* Teal 700 */
@@ -40,6 +41,7 @@
     }
 
     [data-theme="dark"] {
+      color-scheme: dark; /* native menus, selects, and date pickers go dark too */
       --primary-color: #2DD4BF;  /* Teal 400 */
       --primary-strong: #14B8A6; /* Teal 500 */
       --gradient: linear-gradient(135deg, #2DD4BF 0%, #34D399 100%);
@@ -89,6 +91,11 @@
       border-radius: var(--border-radius);
       box-shadow: var(--shadow);
       margin-bottom: 20px;
+      animation: fadeIn 0.4s ease;
+    }
+
+    ::selection {
+      background: color-mix(in srgb, var(--primary-color) 25%, transparent);
     }
     
     .header {
@@ -97,9 +104,7 @@
       align-items: center;
       margin-bottom: 20px;
       padding: 15px 25px;
-      background: color-mix(in srgb, var(--card-bg) 82%, transparent);
-      backdrop-filter: blur(12px);
-      -webkit-backdrop-filter: blur(12px);
+      background: var(--card-bg); /* solid — content never shows through */
       border: 1px solid var(--border-color);
       border-radius: var(--border-radius);
       box-shadow: var(--shadow);
@@ -188,6 +193,33 @@
       display: flex;
       align-items: center;
       gap: 10px;
+    }
+
+    /* Icon chip in front of every section title */
+    .section-header > i {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 30px;
+      height: 30px;
+      flex: 0 0 30px;
+      border-radius: 8px;
+      background: color-mix(in srgb, var(--primary-color) 12%, transparent);
+      color: var(--primary-strong);
+      font-size: 13px;
+    }
+
+    .row-count {
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--muted-color);
+    }
+
+    .add-entry-btn {
+      width: auto;
+      padding: 12px 26px;
+      border-radius: var(--radius-sm);
+      font-weight: 700;
     }
 
     .hamburger-menu {
@@ -748,6 +780,16 @@
       color: var(--secondary-color);
     }
 
+    .pill .label i {
+      margin-right: 4px;
+      font-size: 10px;
+    }
+
+    .pill .value-expense { color: var(--danger-color); }
+    .pill .value-income { color: var(--success-color); }
+    #netTotal.pos { color: var(--success-color); }
+    #netTotal.neg { color: var(--danger-color); }
+
     #netTotal {
       color: var(--primary-color);
     }
@@ -779,14 +821,29 @@
       left: -9999px;
     }
     
+    /* Floating toast: never shifts the page layout */
     .status-message {
-      padding: 16px 24px;
-      margin: 20px 0;
-      border-radius: 10px;
+      position: fixed;
+      bottom: max(24px, env(safe-area-inset-bottom));
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 3000;
+      min-width: 240px;
+      max-width: min(92vw, 520px);
+      padding: 14px 22px;
+      margin: 0;
+      border-radius: 12px;
       display: none;
+      text-align: center;
       font-weight: 500;
-      font-size: 16px;
-      width: auto;
+      font-size: 15px;
+      box-shadow: var(--shadow-lg);
+      animation: toastIn 0.25s ease;
+    }
+
+    @keyframes toastIn {
+      from { opacity: 0; transform: translate(-50%, 12px); }
+      to { opacity: 1; transform: translate(-50%, 0); }
     }
     
     .status-success {
@@ -1168,6 +1225,41 @@
         animation-duration: 0.01ms !important;
         transition-duration: 0.01ms !important;
       }
+    }
+
+    /* Empty table state */
+    tr.empty-row td {
+      border-top: none !important;
+      position: static !important;
+      background: var(--card-bg) !important;
+      box-shadow: none !important;
+      font-weight: normal !important;
+    }
+
+    .empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+      padding: 48px 20px;
+      text-align: center;
+      color: var(--muted-color);
+    }
+
+    .empty-state > i {
+      font-size: 34px;
+      opacity: 0.4;
+      margin-bottom: 6px;
+    }
+
+    .empty-state .empty-title {
+      font-weight: 700;
+      font-size: 15px;
+      color: var(--secondary-color);
+    }
+
+    .empty-state .empty-hint {
+      font-size: 13px;
     }
 
     /* Footer */
