@@ -497,6 +497,11 @@
     el.addEventListener('input', () => { datePreset.value = 'custom'; }));
 
   function applyRecurringTransactions(auto = false) {
+    // After a manual clear/fresh start, auto-apply stays off for the rest of
+    // the month so cleared recurring entries don't resurrect on reload.
+    const monthKey = todayStr().slice(0, 7);
+    if (auto && localStorage.getItem('spendwise_skip_recurring') === monthKey) return;
+
     const settings = getSettings();
     if (settings.recurring.length === 0) {
       if (!auto) showStatus('⚠️ No recurring transactions defined in Settings.', true);
@@ -542,7 +547,11 @@
       : `✅ Applied ${count} recurring transaction${count > 1 ? 's' : ''}${skipped ? ` (${skipped} already present)` : ''}.`);
   }
 
-  applyRecurringBtn.addEventListener('click', () => applyRecurringTransactions(false));
+  applyRecurringBtn.addEventListener('click', () => {
+    // Explicitly applying re-enables the monthly auto-apply
+    localStorage.removeItem('spendwise_skip_recurring');
+    applyRecurringTransactions(false);
+  });
 
   // Charts open only when there is data to draw (respecting active filters)
   function openChart(updateFn, modal) {
@@ -1123,10 +1132,15 @@
     });
   }
 
+  function suppressRecurringThisMonth() {
+    try { localStorage.setItem('spendwise_skip_recurring', todayStr().slice(0, 7)); } catch (e) { /* best effort */ }
+  }
+
   function clearTable() {
     if (confirm('🗑️ Clear all data? This action cannot be undone.')) {
       budgetData = [];
       inlineEditIndex = -1;
+      suppressRecurringThisMonth();
       renderTable();
       showStatus('✅ All data cleared!');
     }
@@ -1906,6 +1920,7 @@
     const snapshot = budgetData;
     budgetData = [];
     inlineEditIndex = -1;
+    suppressRecurringThisMonth();
 
     // Reset every filter too, so the new session is truly blank
     filterStartDate.value = '';
@@ -1919,6 +1934,7 @@
     window.scrollTo({ top: 0, behavior: 'smooth' });
     showStatus('✨ Fresh start — all transactions cleared.', false, () => {
       budgetData = snapshot;
+      localStorage.removeItem('spendwise_skip_recurring');
       renderTable();
       showStatus('↩️ Transactions restored.');
     });
