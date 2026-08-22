@@ -1884,19 +1884,44 @@
     }
   });
 
-  // Clicking the app name hard-refreshes: clears the offline cache, then reloads
-  // fresh from the server (saved transactions and settings are untouched).
+  // Clicking the app name starts a brand-new session: clears the form,
+  // filters, and all transactions (confirmed, and undoable for a few seconds).
   const appTitle = document.querySelector('h1');
   appTitle.style.cursor = 'pointer';
-  appTitle.title = 'Refresh Moneta';
-  appTitle.addEventListener('click', async () => {
-    try {
-      if ('caches' in window) {
-        const keys = await caches.keys();
-        await Promise.all(keys.map(k => caches.delete(k)));
-      }
-    } catch (e) { /* cache API unavailable — plain reload still works */ }
-    location.reload();
+  appTitle.title = 'Start fresh';
+  appTitle.addEventListener('click', () => {
+    resetForm();
+    closeCategoryPickers();
+
+    if (budgetData.length === 0) {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      showStatus('🧹 Form cleared — ready for entry.');
+      return;
+    }
+
+    if (!confirm('Start fresh? This clears the form and ALL transactions below so you can begin new data entry.\n\nTip: download an Excel backup first if you need this data.')) {
+      return;
+    }
+
+    const snapshot = budgetData;
+    budgetData = [];
+    inlineEditIndex = -1;
+
+    // Reset every filter too, so the new session is truly blank
+    filterStartDate.value = '';
+    filterEndDate.value = '';
+    filterMinAmount.value = '';
+    filterMaxAmount.value = '';
+    searchInput.value = '';
+    document.getElementById('datePreset').value = 'all';
+
+    renderTable();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    showStatus('✨ Fresh start — all transactions cleared.', false, () => {
+      budgetData = snapshot;
+      renderTable();
+      showStatus('↩️ Transactions restored.');
+    });
   });
 
   // Press Enter anywhere in the entry form to add the transaction
