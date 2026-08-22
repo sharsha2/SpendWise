@@ -1,6 +1,6 @@
 {
-  "name": "SpendWise",
-  "short_name": "SpendWise",
+  "name": "Moneta",
+  "short_name": "Moneta",
   "description": "Personal expense tracker with budgets, reports, and Excel import/export.",
   "start_url": ".",
   "scope": ".",

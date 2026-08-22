@@ -1182,7 +1182,7 @@
     return s;
   }
 
-  // Accepts rows from any SpendWise export — old files without a Category
+  // Accepts rows from any Moneta export — old files without a Category
   // column and files re-saved by Excel included — and normalizes them.
   function normalizeRow(row) {
     const debitRaw = row['Debit [D]'];
@@ -1888,7 +1888,7 @@
   // fresh from the server (saved transactions and settings are untouched).
   const appTitle = document.querySelector('h1');
   appTitle.style.cursor = 'pointer';
-  appTitle.title = 'Refresh SpendWise';
+  appTitle.title = 'Refresh Moneta';
   appTitle.addEventListener('click', async () => {
     try {
       if ('caches' in window) {

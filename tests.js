@@ -1,4 +1,4 @@
-/* SpendWise unit tests — run with: node tests.js
+/* Moneta unit tests — run with: node tests.js
    Extracts the pure functions from app.js (no browser needed) and checks
    money precision, date normalization, and category detection. */
 const fs = require('fs');

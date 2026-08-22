@@ -1,5 +1,5 @@
 /* Self-destructing service worker.
-   Caching is disabled for SpendWise: this file exists only so browsers that
+   Caching is disabled for Moneta: this file exists only so browsers that
    installed an earlier version fetch it, remove every cache, and unregister —
    after which all visits load fresh from the server with no cache at all. */
 self.addEventListener('install', () => self.skipWaiting());
