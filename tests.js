@@ -199,6 +199,24 @@ t('save groups: every row is saved exactly once', () => {
   eq([...g.values()].reduce((n, list) => n + list.length, 0), 50);
 });
 
+// ---- Store autocomplete ranking ----
+t('autocomplete: starts-with beats word match beats contains; your stores first', () => {
+  const entries = [
+    { name: 'Discount Store', count: 9, mine: true },
+    { name: 'Costco', count: 3, mine: true },
+    { name: 'The Cosmetics Shop', count: 5, mine: true },
+    { name: 'Cost Plus', count: 0, mine: false }
+  ];
+  eq(rankStoreSuggestions('cos', entries, 6).map(e => e.name).join(','), 'Costco,The Cosmetics Shop,Cost Plus');
+});
+
+t('autocomplete: more-used store wins a tie; exact match and empty query give nothing new', () => {
+  const entries = [{ name: 'Tim Hortons', count: 2, mine: true }, { name: 'Tims Pizza', count: 7, mine: true }];
+  eq(rankStoreSuggestions('tim', entries, 6)[0].name, 'Tims Pizza');
+  eq(rankStoreSuggestions('tim hortons', entries, 6).length, 0);
+  eq(rankStoreSuggestions('  ', entries, 6).length, 0);
+});
+
 // ---- Budgets ----
 t('forecast projects month-end spend from pace', () => {
   eq(forecastMonth(30000, 10, 30), 90000);   // $300 by day 10 → $900

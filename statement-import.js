@@ -374,6 +374,7 @@ if (typeof document !== 'undefined') {
     const entries = importRows.filter(r => r.include).map(r => buildEntry(r, person, bank));
     if (!entries.length) return;
     budgetData.push(...entries);
+    rememberStores(entries);
     markChanged(entries.length);
     dashPinned = null;
     closeImportReview();

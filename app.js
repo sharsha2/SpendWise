@@ -610,6 +610,7 @@
     if (confirm('Reset all settings (people, banks, budgets, categories, recurring)? Your transaction table is not affected.')) {
       localStorage.removeItem('spendwise_settings');
       localStorage.removeItem('spendwise_data'); // legacy key from older versions
+      forgetStores();
       invalidateCategoryCache();
       populateSettingsUI();
       updateDropdowns();
@@ -977,6 +978,7 @@
 
     budgetData.push(entry);
     rememberLastUsed(entry);
+    rememberStores([entry]);
     markChanged();
     dashPinned = null; // jump the overview to the month just added to
     renderTable();
@@ -1067,45 +1069,238 @@
     document.body.classList.remove('sheet-locked');
   }
 
-  // Store suggestions come from your own history, most used first
-  function refreshStoreSuggestions() {
-    const stores = new Map();
+  // ---- Store memory & autocomplete ----
+  // Every store you use is remembered on this device (never uploaded) with what
+  // you picked last time, so typing a few letters can complete it and fill the rest.
+  const STORE_KEY = 'spendwise_stores';
+  const STORE_LIMIT = 800;
+  let storeMemory = null;
+
+  function loadStoreMemory() {
+    if (storeMemory) return storeMemory;
+    storeMemory = {};
+    try {
+      const raw = JSON.parse(localStorage.getItem(STORE_KEY));
+      if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+        Object.entries(raw).forEach(([k, v]) => {
+          if (isSafeKey(k) && v && typeof v.name === 'string') storeMemory[k] = v;
+        });
+      }
+    } catch (e) { /* corrupted — start fresh */ }
+    return storeMemory;
+  }
+
+  // Learns from rows (added, edited, opened or imported). Later rows win.
+  function rememberStores(rows) {
+    const mem = loadStoreMemory();
+    let changed = false;
+    rows.forEach(r => {
+      const name = String(r['Purchased Store'] || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+      const key = name.toLowerCase();
+      if (!name || !isSafeKey(key)) return;
+      const prev = mem[key];
+      mem[key] = {
+        name,
+        count: (prev ? prev.count : 0) + 1,
+        used: Date.now(),
+        person: r['Purchased By'] || '',
+        bank: r['Bank Name'] || '',
+        category: r['Category'] || '',
+        type: toCents(r['Credit [C]']) > toCents(r['Debit [D]']) ? 'C' : 'D'
+      };
+      changed = true;
+    });
+    if (!changed) return;
+    const keys = Object.keys(mem);
+    if (keys.length > STORE_LIMIT) {
+      keys.sort((a, b) => (mem[a].used || 0) - (mem[b].used || 0))
+        .slice(0, keys.length - STORE_LIMIT).forEach(k => delete mem[k]);
+    }
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(mem)); } catch (e) { /* storage full */ }
+  }
+
+  function forgetStores() {
+    storeMemory = {};
+    try { localStorage.removeItem(STORE_KEY); } catch (e) { /* ignore */ }
+  }
+
+  // Common store names offered before you've used them yourself
+  const COMMON_STORES = [
+    'Costco', 'Walmart', 'No Frills', 'FreshCo', 'Food Basics', 'Sobeys', 'Loblaws', 'Real Canadian Superstore',
+    'Metro', 'Farm Boy', 'T&T Supermarket', 'Shoppers Drug Mart', 'Rexall', 'Dollarama', 'Winners', 'Canadian Tire',
+    'Home Depot', 'IKEA', 'Best Buy', 'Amazon', 'Apple', 'Tim Hortons', 'Starbucks', "McDonald's", 'KFC', "Wendy's",
+    'Popeyes', 'Taco Bell', 'Chipotle', 'Subway', 'A&W', 'Pizza Pizza', "Domino's", 'Uber Eats', 'DoorDash',
+    'SkipTheDishes', 'Uber', 'Lyft', 'Presto', 'GO Transit', 'VIA Rail', 'Air Canada', 'WestJet', 'Airbnb',
+    'Shell', 'Esso', 'Petro-Canada', 'Pioneer', 'Rogers', 'Bell', 'Telus', 'Fido', 'Koodo', 'Freedom Mobile',
+    'Virgin Plus', 'Hydro One', 'Enbridge', 'Toronto Hydro', 'Netflix', 'Spotify', 'Disney+', 'Crave',
+    'YouTube Premium', 'iCloud', 'Google One', 'Amazon Prime', 'GoodLife Fitness', 'PetSmart', 'Wealthsimple',
+    'Questrade', 'Remitly', 'Wise', 'Udemy', 'Coursera', 'Cineplex', 'Payroll', 'Rent'
+  ];
+
+  // Suggestions for the add form: your stores first, then common ones
+  function storeSuggestionsFor(query) {
+    const mem = loadStoreMemory();
+    const entries = Object.values(mem).map(v => ({ name: v.name, count: v.count || 1, used: v.used || 0, mine: true }));
+    const seen = new Set(entries.map(e => e.name.toLowerCase()));
     budgetData.forEach(r => {
       const name = String(r['Purchased Store'] || '').trim();
-      if (!name) return;
-      const key = name.toLowerCase();
-      const cur = stores.get(key) || { name, count: 0 };
-      cur.count++;
-      stores.set(key, cur);
+      if (name && !seen.has(name.toLowerCase())) { seen.add(name.toLowerCase()); entries.push({ name, count: 1, used: 0, mine: true }); }
     });
-    document.getElementById('storeSuggestions').innerHTML = [...stores.values()]
-      .sort((a, b) => b.count - a.count).slice(0, 300)
-      .map(s => `<option value="${escapeHtml(s.name)}"></option>`).join('');
+    if (query.trim().length >= 2) {
+      COMMON_STORES.forEach(name => {
+        if (!seen.has(name.toLowerCase())) entries.push({ name, count: 0, used: 0, mine: false });
+      });
+    }
+    return rankStoreSuggestions(query, entries, 6);
+  }
+
+  // What we last used at a store: the newest row in the table, else memory
+  function lastUseOf(storeName) {
+    const key = storeName.trim().toLowerCase();
+    if (!key) return null;
+    for (let i = budgetData.length - 1; i >= 0; i--) {
+      const r = budgetData[i];
+      if (String(r['Purchased Store'] || '').trim().toLowerCase() === key) {
+        return {
+          person: r['Purchased By'], bank: r['Bank Name'], category: r['Category'] || '',
+          type: toCents(r['Credit [C]']) > toCents(r['Debit [D]']) ? 'C' : 'D'
+        };
+      }
+    }
+    const m = loadStoreMemory()[key];
+    return m ? { person: m.person, bank: m.bank, category: m.category, type: m.type } : null;
   }
 
   // Picking a store you've used before fills person, bank, type and category
-  // from your most recent entry there
   function autofillFromStore() {
-    const name = document.getElementById('store').value.trim().toLowerCase();
     const hint = document.getElementById('storeHint');
-    if (!name) { hint.textContent = ''; return; }
-    let last = null;
-    for (let i = budgetData.length - 1; i >= 0; i--) {
-      if (String(budgetData[i]['Purchased Store'] || '').trim().toLowerCase() === name) { last = budgetData[i]; break; }
-    }
+    const last = lastUseOf(document.getElementById('store').value);
     if (!last) { hint.textContent = ''; return; }
     const setIfOption = (id, value) => {
       const sel = document.getElementById(id);
-      if ([...sel.options].some(o => o.value === value)) sel.value = value;
+      if (value && [...sel.options].some(o => o.value === value)) sel.value = value;
     };
-    setIfOption('purchasedBy', last['Purchased By']);
-    setIfOption('bank', last['Bank Name']);
-    const isIncome = toCents(last['Credit [C]']) > 0 && !toCents(last['Debit [D]']);
-    setEntryType(document.querySelector('#entryCard .type-toggle'), isIncome ? 'C' : 'D');
+    setIfOption('purchasedBy', last.person);
+    setIfOption('bank', last.bank);
+    setEntryType(document.querySelector('#entryCard .type-toggle'), last.type === 'C' ? 'C' : 'D');
     const catSel = document.getElementById('category');
-    catSel.value = last['Category'] && [...catSel.options].some(o => o.value === last['Category']) ? last['Category'] : '';
+    catSel.value = last.category && [...catSel.options].some(o => o.value === last.category) ? last.category : '';
     updateCategoryHint();
     hint.textContent = '✓ filled from last time';
+  }
+
+  // Combobox: inline completion while typing + a list of matches.
+  // ↑/↓ move, Enter/Tab accept, Esc closes. onAccept runs after a pick.
+  function attachStoreAutocomplete(input, onAccept) {
+    const list = document.createElement('ul');
+    list.className = 'ac-list';
+    list.id = input.id + 'Suggestions';
+    list.setAttribute('role', 'listbox');
+    list.hidden = true;
+    input.insertAdjacentElement('afterend', list);
+    input.parentElement.classList.add('ac-host');
+    input.setAttribute('role', 'combobox');
+    input.setAttribute('aria-autocomplete', 'both');
+    input.setAttribute('aria-expanded', 'false');
+    input.setAttribute('aria-controls', list.id);
+
+    // Inline completion fights with phone keyboards' own suggestions
+    const inline = !window.matchMedia('(pointer: coarse)').matches;
+    let items = [];
+    let active = -1;
+    let typed = '';
+
+    const close = () => {
+      list.hidden = true;
+      input.setAttribute('aria-expanded', 'false');
+      input.removeAttribute('aria-activedescendant');
+      active = -1;
+    };
+
+    const highlight = (name) => {
+      const i = name.toLowerCase().indexOf(typed.toLowerCase());
+      if (!typed || i < 0) return escapeHtml(name);
+      return escapeHtml(name.slice(0, i)) + '<mark>' + escapeHtml(name.slice(i, i + typed.length)) + '</mark>' + escapeHtml(name.slice(i + typed.length));
+    };
+
+    const render = () => {
+      if (!items.length) { close(); return; }
+      list.innerHTML = items.map((it, i) =>
+        `<li role="option" id="${list.id}-${i}" class="ac-item${i === active ? ' active' : ''}" aria-selected="${i === active}" data-i="${i}">` +
+        `<span class="ac-name">${highlight(it.name)}</span>${it.mine ? '' : '<span class="ac-tag">suggested</span>'}</li>`).join('');
+      // Open just below the input (the label also holds a title above it)
+      list.style.top = `${input.offsetTop + input.offsetHeight + 4}px`;
+      list.hidden = false;
+      input.setAttribute('aria-expanded', 'true');
+      if (active >= 0) input.setAttribute('aria-activedescendant', `${list.id}-${active}`);
+      else input.removeAttribute('aria-activedescendant');
+    };
+
+    const accept = (name) => {
+      input.value = name;
+      input.setSelectionRange(name.length, name.length);
+      close();
+      if (onAccept) onAccept(name);
+    };
+
+    input.addEventListener('input', (e) => {
+      typed = input.value;
+      if (!typed.trim()) { items = []; close(); if (onAccept) onAccept(''); return; }
+      items = storeSuggestionsFor(typed);
+      active = -1;
+      // Complete inline only while adding letters at the end, never on delete
+      const top = items[0];
+      if (inline && top && !e.isComposing && e.inputType && e.inputType.startsWith('insert') &&
+          input.selectionEnd === typed.length && top.name.toLowerCase().startsWith(typed.toLowerCase()) &&
+          top.name.length > typed.length) {
+        input.value = typed + top.name.slice(typed.length);
+        input.setSelectionRange(typed.length, top.name.length);
+        active = 0;
+      }
+      render();
+      // An exact match fills the rest straight away
+      if (lastUseOf(input.value) && input.selectionStart === input.selectionEnd && onAccept) onAccept(input.value);
+    });
+
+    input.addEventListener('keydown', (e) => {
+      if (list.hidden) {
+        if (e.key === 'ArrowDown' && input.value.trim()) {
+          typed = input.value;
+          items = storeSuggestionsFor(typed);
+          active = items.length ? 0 : -1;
+          render();
+          e.preventDefault();
+        }
+        return;
+      }
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        active = e.key === 'ArrowDown' ? Math.min(active + 1, items.length - 1) : Math.max(active - 1, 0);
+        input.value = items[active].name;
+        render();
+      } else if (e.key === 'Enter' || (e.key === 'Tab' && active >= 0 && !e.shiftKey)) {
+        if (active >= 0 || input.selectionStart !== input.selectionEnd) {
+          e.preventDefault();
+          e.stopPropagation(); // first Enter picks the store; the next one adds
+          accept(active >= 0 ? items[active].name : input.value);
+        } else {
+          close();
+        }
+      } else if (e.key === 'Escape') {
+        e.stopPropagation();
+        if (input.selectionStart !== input.selectionEnd) input.value = typed; // drop the inline part
+        close();
+      }
+    });
+
+    list.addEventListener('mousedown', (e) => {
+      const li = e.target.closest('.ac-item');
+      if (!li) return;
+      e.preventDefault(); // keep focus in the input
+      accept(items[Number(li.dataset.i)].name);
+    });
+
+    input.addEventListener('blur', () => setTimeout(close, 120));
   }
 
   function populateCategoryDropdown() {
@@ -1366,7 +1561,6 @@
     const live = new Set(budgetData);
     [...selectedRows].forEach(r => { if (!live.has(r)) selectedRows.delete(r); });
     updateBulkBar(filteredData);
-    refreshStoreSuggestions();
 
     if (filteredData.length === 0) {
       table.classList.remove('grouped');
@@ -1565,6 +1759,7 @@
     const before = budgetData[editIndex];
     const at = editIndex;
     budgetData[at] = entry;
+    rememberStores([entry]);
     if (selectedRows.delete(before)) selectedRows.add(entry);
     markChanged();
     closeEditor();
@@ -1976,6 +2171,7 @@
         return false;
       }
       budgetData = jsonData.map(normalizeRow);
+      rememberStores(budgetData);
       source = {
         name: file.name,
         months: [...new Set(budgetData.map(monthKeyOf).filter(Boolean))],
@@ -2226,6 +2422,26 @@
     if (spentC > limitC) return 'over';
     if (projectedC !== null && projectedC > limitC) return 'risk';
     return 'ok';
+  }
+  // Ranks store names for a query: starts-with, then word starts-with, then
+  // contains; ties go to stores you use more often, then more recently.
+  function rankStoreSuggestions(query, entries, limit) {
+    const q = query.trim().toLowerCase();
+    if (!q) return [];
+    const scored = [];
+    entries.forEach(e => {
+      const n = e.name.toLowerCase();
+      if (n === q) return; // already typed in full
+      let rank;
+      if (n.startsWith(q)) rank = 0;
+      else if (n.split(/[\s\-&.,/]+/).some(w => w.startsWith(q))) rank = 1;
+      else if (n.includes(q)) rank = 2;
+      else return;
+      scored.push({ e, rank: rank + (e.mine ? 0 : 3) });
+    });
+    scored.sort((a, b) => a.rank - b.rank || (b.e.count || 0) - (a.e.count || 0) ||
+      (b.e.used || 0) - (a.e.used || 0) || a.e.name.localeCompare(b.e.name));
+    return scored.slice(0, limit).map(s => s.e);
   }
   // ---- end pure helpers ----
 
@@ -3153,7 +3369,8 @@
 
   document.getElementById('currencySelect').addEventListener('change', (e) => setCurrencySetting(e.target.value));
   ['date', 'editDate'].forEach(id => document.getElementById(id).addEventListener('input', syncDateChips));
-  document.getElementById('store').addEventListener('input', autofillFromStore);
+  attachStoreAutocomplete(document.getElementById('store'), () => autofillFromStore());
+  attachStoreAutocomplete(document.getElementById('editStore'), null);
 
   // Phone: the + button opens the add form as a bottom sheet
   document.getElementById('fab').addEventListener('click', openEntrySheet);

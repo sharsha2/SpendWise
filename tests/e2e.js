@@ -147,6 +147,19 @@ const server = http.createServer((req, res) => {
   ok('card payment not counted as spending', Math.abs(totals.spent - (85 + 140 + 16.99 + 60)) < 0.001, JSON.stringify(totals));
   ok('payment row labelled as transfer', (await p.$$eval('.kind-tag', els => els.map(e => e.textContent))).some(t => t.includes('Transfer')));
 
+  // Store autocomplete: inline completion, list, Enter accepts without adding
+  const rowsBeforeAc = await p.evaluate(() => budgetData.length);
+  await p.click('#store'); await p.keyboard.type('Net'); await sleep(120);
+  const ac = await p.$eval('#store', el => ({ v: el.value, sel: el.value.slice(el.selectionStart, el.selectionEnd) }));
+  ok('autocomplete completes inline', ac.v === 'Netflix' && ac.sel === 'flix', JSON.stringify(ac));
+  ok('autocomplete list shows', await vis('#storeSuggestions'));
+  await shot('autocomplete.png', '#entryCard');
+  await p.keyboard.press('Enter'); await sleep(120);
+  ok('Enter accepts suggestion', (await p.$eval('#store', el => el.value)) === 'Netflix' && !(await vis('#storeSuggestions')));
+  ok('accepting does not add a row', await p.evaluate(() => budgetData.length) === rowsBeforeAc);
+  ok('accepting fills from last time', ((await text('#storeHint')) || '').includes('filled'));
+  await p.$eval('#store', el => { el.value = ''; });
+
   // Add entry
   await p.click('#addBtn'); await sleep(80);
   ok('inline error for empty amount', (await text('#amountError')) === 'Enter an amount');
@@ -241,6 +254,11 @@ const server = http.createServer((req, res) => {
   const nDraft = await p.evaluate(() => budgetData.length);
   await p.reload({ waitUntil: 'networkidle0' }); await sleep(300);
   ok('fresh visit is blank', await p.evaluate(() => budgetData.length) === 0);
+  await p.click('#store'); await p.keyboard.type('Wal'); await sleep(120);
+  ok('stores are remembered across visits', (await p.$eval('#store', el => el.value)) === 'Walmart');
+  await p.keyboard.press('Escape');
+  ok('Escape drops the inline completion', (await p.$eval('#store', el => el.value)) === 'Wal');
+  await p.$eval('#store', el => { el.value = ''; });
   ok('restore bar', await vis('#draftBanner'));
   await p.click('#draftRestore'); await sleep(300);
   ok('restore', await p.evaluate(() => budgetData.length) === nDraft);
