@@ -5,7 +5,8 @@
   <title>Moneta</title>
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="description" content="Moneta — a simple personal expense tracker with budgets, reports, and Excel import/export.">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net 'unsafe-inline'; style-src 'self' https://cdnjs.cloudflare.com https://fonts.googleapis.com 'unsafe-inline'; font-src https://fonts.gstatic.com https://cdnjs.cloudflare.com; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'">
+  <!-- Everything is served from this site: no third-party requests, no inline scripts -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; worker-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'">
   <meta name="referrer" content="no-referrer">
   <meta name="theme-color" content="#0D9488">
   <meta name="mobile-web-app-capable" content="yes">
@@ -15,13 +16,11 @@
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" href="icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="icon-180.png">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js" integrity="sha512-r22gChDnGvBylk90+2e/ycr3RVrDi8DIOkIGNhJlKfuyQM4tIRAI062MaV8sfjQKYVGjOBaZBOA87z+IhZE9DA==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" integrity="sha384-9nhczxUqK87bcKHh20fSQcTGD4qq5GhayNYSYWqwBkINBhOfQLg/P5HG5lF1urn4" crossorigin="anonymous"></script>
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-  <link rel="stylesheet" href="styles.css?v=20260822">
+  <link rel="preload" href="vendor/inter/inter-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <script src="vendor/xlsx/xlsx.full.min.js"></script>
+  <script src="vendor/chartjs/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="vendor/fontawesome/css/all.min.css">
+  <link rel="stylesheet" href="styles.css?v=20261102">
 </head>
 <body>
 
@@ -34,10 +33,10 @@
           <i class="fas fa-bars"></i> Menu
         </button>
         <div class="menu-options" id="menuOptions">
-          <div class="menu-option" onclick="openReportsHub()"><i class="fas fa-chart-line"></i> Financial Reports</div>
-          <div class="menu-option" onclick="openSettingsModal()"><i class="fas fa-cog"></i> Settings</div>
-          <div class="menu-option" onclick="openCompareModal()"><i class="fas fa-balance-scale"></i> Compare Months</div>
-          <div class="menu-option" onclick="toggleTheme()"><i id="themeIcon" class="fas fa-moon"></i> <span id="themeText">Dark Mode</span></div>
+          <button type="button" class="menu-option" data-action="openReportsHub"><i class="fas fa-chart-line"></i> Financial Reports</button>
+          <button type="button" class="menu-option" data-action="openSettingsModal"><i class="fas fa-cog"></i> Settings</button>
+          <button type="button" class="menu-option" data-action="openCompareModal"><i class="fas fa-balance-scale"></i> Compare Months</button>
+          <button type="button" class="menu-option" data-action="toggleTheme"><i id="themeIcon" class="fas fa-moon"></i> <span id="themeText">Dark Mode</span></button>
         </div>
       </div>
     </div>
@@ -45,38 +44,99 @@
 
   <div class="status-message" id="statusMessage"></div>
 
-  <section class="section-card">
-    <div class="section-header"><i class="fas fa-wallet"></i> Financial Summary</div>
-    <div class="totals">
-      <div class="pill"><span class="label"><i class="fas fa-arrow-trend-down"></i> Total Expenses</span><span class="value value-expense" id="totalDebit">$0.00</span></div>
-      <div class="pill"><span class="label"><i class="fas fa-arrow-trend-up"></i> Total Income</span><span class="value value-income" id="totalCredit">$0.00</span></div>
-      <div class="pill"><span class="label"><i class="fas fa-scale-balanced"></i> Net Balance</span><span class="value" id="netTotal">$0.00</span></div>
+  <section class="section-card dashboard-card" id="overviewSection">
+    <div class="dash-head">
+      <div class="section-header" style="margin-bottom: 0;"><i class="fas fa-gauge-high"></i> Overview</div>
+      <div class="month-switcher">
+        <button type="button" class="action-btn ghost" id="dashPrev" aria-label="Previous month"><i class="fas fa-chevron-left"></i></button>
+        <select id="dashPeriod" aria-label="Overview period"></select>
+        <button type="button" class="action-btn ghost" id="dashNext" aria-label="Next month"><i class="fas fa-chevron-right"></i></button>
+      </div>
     </div>
-    <div id="budgetTrackingSection" style="display: none; border-top: 1px solid var(--border-color); margin-top: 20px; padding-top: 15px;">
-      <div class="section-header" style="font-size: 0.9em; margin-bottom: 10px;"><i class="fas fa-bullseye"></i> Monthly Budget Tracking <span id="budgetMonthLabel" style="font-weight: 500; color: var(--muted-color);"></span></div>
+
+    <div class="kpi-grid">
+      <div class="kpi"><span class="kpi-label"><i class="fas fa-arrow-trend-down"></i> Spent</span><span class="kpi-value value-expense" id="kpiSpent">$0.00</span><span class="kpi-delta" id="kpiSpentDelta"></span></div>
+      <div class="kpi"><span class="kpi-label"><i class="fas fa-arrow-trend-up"></i> Income</span><span class="kpi-value value-income" id="kpiIncome">$0.00</span><span class="kpi-delta" id="kpiIncomeDelta"></span></div>
+      <div class="kpi"><span class="kpi-label"><i class="fas fa-scale-balanced"></i> Net</span><span class="kpi-value" id="kpiNet">$0.00</span><span class="kpi-delta" id="kpiNetDelta"></span></div>
+      <div class="kpi"><span class="kpi-label"><i class="fas fa-piggy-bank"></i> Savings rate</span><span class="kpi-value" id="kpiRate">—</span><span class="kpi-delta" id="kpiRateDelta"></span></div>
+    </div>
+
+    <div class="dash-empty empty-state" id="dashEmpty" hidden>
+      <i class="fas fa-chart-simple"></i>
+      <div class="empty-title">Your dashboard appears here</div>
+      <div class="empty-hint">Add a transaction below, or upload any Moneta Excel file (old files work too).</div>
+    </div>
+
+    <div class="dash-grid" id="dashCharts">
+      <div class="dash-panel">
+        <div class="dash-title">Where your money went</div>
+        <div class="dash-sub" id="dashCategorySub"></div>
+        <div class="dash-chart"><canvas id="dashCategoryChart" role="img" aria-label="Spending by category"></canvas></div>
+      </div>
+      <div class="dash-panel">
+        <div class="dash-title">Spending pace</div>
+        <div class="dash-sub" id="dashPaceSub"></div>
+        <div class="dash-chart" id="dashPaceWrap"><canvas id="dashPaceChart" role="img" aria-label="Cumulative spending this month compared with last month"></canvas></div>
+      </div>
+      <div class="dash-panel">
+        <div class="dash-title">Income vs expenses</div>
+        <div class="dash-sub" id="dashTrendSub"></div>
+        <div class="dash-chart"><canvas id="dashTrendChart" role="img" aria-label="Monthly income and expenses"></canvas></div>
+      </div>
+      <div class="dash-panel">
+        <div class="dash-title">Top stores</div>
+        <div class="dash-sub">Where you spent the most</div>
+        <ol class="top-list" id="dashTopStores"></ol>
+      </div>
+    </div>
+
+    <div id="budgetTrackingSection" class="budget-section" style="display: none;">
+      <div class="section-header budget-title"><i class="fas fa-bullseye"></i> Budgets <span id="budgetMonthLabel" class="budget-month"></span></div>
       <div class="budget-progress-container" id="budgetProgressList"></div>
     </div>
   </section>
 
-  <!-- Dashboard & Add Entry View -->
+  <!-- Restores entries that weren't downloaded before the tab closed -->
+  <div class="draft-banner" id="draftBanner" role="status" hidden>
+    <i class="fas fa-clock-rotate-left"></i>
+    <span id="draftText"></span>
+    <div class="draft-actions">
+      <button type="button" class="pill-btn primary" id="draftRestore">Restore</button>
+      <button type="button" class="pill-btn ghost" id="draftDiscard">Discard</button>
+    </div>
+  </div>
+
   <div id="dashboardView" class="view-section active">
-    <section class="section-card">
-      <div class="section-header"><i class="fas fa-plus-circle"></i> Add New Transaction</div>
+    <!-- Add transaction: inline card on desktop, bottom sheet on phones -->
+    <div class="sheet-backdrop" id="sheetBackdrop" hidden></div>
+    <section class="section-card entry-card" id="entryCard" data-type="D" aria-labelledby="entryTitle">
+      <div class="entry-head">
+        <div class="section-header" id="entryTitle" style="margin-bottom: 0;"><i class="fas fa-plus-circle"></i> Add transaction</div>
+        <button type="button" class="sheet-close" id="entryClose" aria-label="Close"><i class="fas fa-times"></i></button>
+      </div>
+
+      <div class="type-toggle" role="radiogroup" aria-label="Transaction type" data-target="type">
+        <button type="button" role="radio" class="type-opt" data-type="D" aria-checked="true"><i class="fas fa-arrow-trend-down"></i> Expense</button>
+        <button type="button" role="radio" class="type-opt" data-type="C" aria-checked="false"><i class="fas fa-arrow-trend-up"></i> Income</button>
+      </div>
+      <input type="hidden" id="type" value="D">
+
       <div class="controls">
-      <div class="grid">
-        <label><div>Date</div><input type="date" id="date"></label>
-        <label><div>Purchased By</div>
-          <select id="purchasedBy"></select>
+      <div class="grid entry-grid">
+        <label class="field-amount"><div>Amount</div>
+          <div class="amount-input"><span class="amount-cur" aria-hidden="true">$</span><input type="number" id="amount" placeholder="0.00" step="0.01" min="0.01" inputmode="decimal" aria-describedby="amountError"></div>
+          <div class="field-error" id="amountError" aria-live="polite"></div>
         </label>
-        <label><div>Store / Description</div><input type="text" id="store" placeholder="Store or description"></label>
-        <label><div>Bank</div>
-          <select id="bank"></select>
+        <label class="field-store"><div>Store / Description <span id="storeHint" class="field-hint"></span></div>
+          <input type="text" id="store" placeholder="e.g. Costco" list="storeSuggestions" autocomplete="off" maxlength="120">
         </label>
-        <label><div>Transaction Type</div>
-          <select id="type">
-            <option value="D">Debit (Expense)</option>
-            <option value="C">Credit (Income)</option>
-          </select>
+        <label class="field-date"><div>Date</div>
+          <input type="date" id="date" aria-describedby="dateError">
+          <div class="date-chips" data-target="date">
+            <button type="button" class="chip" data-offset="0">Today</button>
+            <button type="button" class="chip" data-offset="-1">Yesterday</button>
+          </div>
+          <div class="field-error" id="dateError" aria-live="polite"></div>
         </label>
         <label class="category-field cat-wrap"><div>Category <span id="categoryHint" class="category-hint"></span></div>
           <select id="category" class="sr-select" tabindex="-1" aria-hidden="true">
@@ -88,76 +148,182 @@
           </button>
           <div id="categoryPickerPanel" class="category-picker-panel" hidden></div>
         </label>
-        <label><div>Amount</div><input type="number" id="amount" placeholder="0.00" step="0.01" min="0" inputmode="decimal"></label>
-      </div>
-      <div class="bar">
-        <button class="add-entry-btn primary" id="addBtn"><i class="fas fa-plus"></i> Add Entry</button>
-        <button class="action-btn primary" id="applyRecurringBtn" data-tooltip="Apply Recurring Transactions"><i class="fas fa-redo"></i></button>
-        <button class="action-btn ghost" id="resetFormBtn" data-tooltip="Clear Form"><i class="fas fa-eraser"></i></button>
-        <button class="action-btn ghost" id="downloadBtn" data-tooltip="Download Excel"><i class="fas fa-download"></i></button>
-        <label class="action-btn ghost file-upload-btn" data-tooltip="Upload Excel">
-          <i class="fas fa-file-import"></i>
-          <input type="file" id="uploadFile" accept=".xlsx,.xls" />
+        <label><div>Purchased By</div>
+          <select id="purchasedBy"></select>
         </label>
-        <button id="clearBtn" class="action-btn ghost" data-tooltip="Clear All Data"><i class="fas fa-trash"></i></button>
+        <label><div>Bank / Card</div>
+          <select id="bank"></select>
+        </label>
+      </div>
+      <div class="entry-actions">
+        <button type="button" class="ghost pill-btn" id="resetFormBtn"><i class="fas fa-eraser"></i> Clear</button>
+        <button type="button" class="add-entry-btn primary" id="addBtn"><i class="fas fa-plus"></i> <span id="addBtnLabel">Add expense</span></button>
       </div>
       </div>
     </section>
 
-    <!-- Integrated Transaction History -->
+    <datalist id="storeSuggestions"></datalist>
+
+    <!-- Transactions -->
     <section class="section-card table-section">
       <div class="table-header">
-        <div class="section-header" style="margin-bottom: 0;"><i class="fas fa-list"></i> Transaction History <span id="rowCount" class="row-count"></span></div>
-        <div class="filter-group">
-          <button class="action-btn ghost" id="clearFilterBtn" data-tooltip="Clear Filters">
-            <i class="fas fa-filter-circle-xmark"></i>
-          </button>
-          <select id="datePreset" style="max-width: 140px; padding: 5px; font-size: 13px;" aria-label="Date range preset">
-            <option value="all" selected>All time</option>
-            <option value="this-month">This month</option>
-            <option value="last-month">Last month</option>
-            <option value="last-3">Last 3 months</option>
-            <option value="this-year">This year</option>
-            <option value="custom">Custom range</option>
-          </select>
-          <div style="display: flex; gap: 5px; align-items: center; font-size: 13px;">
-            <input type="date" id="filterStartDate" style="max-width: 130px; padding: 5px;">
-            <span>to</span>
-            <input type="date" id="filterEndDate" style="max-width: 130px; padding: 5px;">
-          </div>
-          <div style="display: flex; gap: 5px; align-items: center; font-size: 13px;">
-            <input type="number" id="filterMinAmount" placeholder="Min $" style="max-width: 80px; padding: 5px;">
-            <span>-</span>
-            <input type="number" id="filterMaxAmount" placeholder="Max $" style="max-width: 80px; padding: 5px;">
-          </div>
-          <div style="width: 250px; position: relative;">
-            <input type="search" id="searchInput" placeholder="Search transactions...">
-          </div>
+        <div class="section-header" style="margin-bottom: 0;"><i class="fas fa-list"></i> Transactions <span id="rowCount" class="row-count"></span></div>
+        <div class="file-actions">
+          <label class="pill-btn ghost file-upload-btn">
+            <i class="fas fa-file-import"></i> <span>Open</span>
+            <input type="file" id="uploadFile" accept=".xlsx,.xls">
+          </label>
+          <label class="pill-btn ghost file-upload-btn">
+            <i class="fas fa-file-pdf"></i> <span>Import PDF</span>
+            <input type="file" id="pdfInput" accept=".pdf,application/pdf" multiple>
+          </label>
+          <button type="button" class="pill-btn primary" id="downloadBtn"><i class="fas fa-download"></i> <span>Save</span> <span class="unsaved-badge" id="unsavedBadge" hidden></span></button>
+          <button type="button" class="pill-btn ghost" id="applyRecurringBtn"><i class="fas fa-redo"></i> <span>Recurring</span></button>
+          <button type="button" class="pill-btn ghost danger" id="clearBtn"><i class="fas fa-trash"></i> <span>Clear all</span></button>
         </div>
       </div>
+
+      <div class="filter-group">
+        <div class="search-box">
+          <i class="fas fa-magnifying-glass" aria-hidden="true"></i>
+          <input type="search" id="searchInput" placeholder="Search store, person, bank, category..." aria-label="Search transactions">
+        </div>
+        <select id="datePreset" aria-label="Date range preset">
+          <option value="all" selected>All time</option>
+          <option value="this-month">This month</option>
+          <option value="last-month">Last month</option>
+          <option value="last-3">Last 3 months</option>
+          <option value="this-year">This year</option>
+          <option value="custom">Custom range</option>
+        </select>
+        <div class="range">
+          <input type="date" id="filterStartDate" aria-label="From date">
+          <span>to</span>
+          <input type="date" id="filterEndDate" aria-label="To date">
+        </div>
+        <div class="range">
+          <input type="number" id="filterMinAmount" placeholder="Min $" aria-label="Minimum amount" inputmode="decimal">
+          <span>–</span>
+          <input type="number" id="filterMaxAmount" placeholder="Max $" aria-label="Maximum amount" inputmode="decimal">
+        </div>
+        <button type="button" class="pill-btn ghost" id="clearFilterBtn"><i class="fas fa-filter-circle-xmark"></i> <span>Reset</span></button>
+      </div>
+
+      <div class="bulk-bar" id="bulkBar" hidden>
+        <span id="bulkCount"></span>
+        <select id="bulkCategory" aria-label="Set category for selected"></select>
+        <button type="button" class="pill-btn ghost" id="bulkApply"><i class="fas fa-tag"></i> Set category</button>
+        <button type="button" class="pill-btn ghost danger" id="bulkDelete"><i class="fas fa-trash"></i> Delete</button>
+        <button type="button" class="pill-btn ghost" id="bulkClear">Cancel</button>
+      </div>
+
       <div class="table-container">
         <table id="budgetTable">
           <thead>
             <tr>
-              <th data-sort="date" data-sort-direction="none">Date <span class="sort-icon"></span></th>
-              <th data-sort="purchasedBy" data-sort-direction="none">Purchased By <span class="sort-icon"></span></th>
-              <th>Store / Description</th>
-              <th>Bank</th>
-              <th class="right">Debit</th>
-              <th class="right">Credit</th>
+              <th class="sel-col"><input type="checkbox" id="selectAll" aria-label="Select all shown transactions"></th>
+              <th class="col-date" data-sort="date" data-sort-direction="none">Date <span class="sort-icon"></span></th>
+              <th>Transaction</th>
+              <th class="col-person" data-sort="purchasedBy" data-sort-direction="none">Person <span class="sort-icon"></span></th>
+              <th class="col-bank">Bank</th>
               <th class="right" data-sort="amount" data-sort-direction="none">Amount <span class="sort-icon"></span></th>
-              <th class="center">Actions</th>
+              <th class="center col-actions"><span class="sr-only">Actions</span></th>
             </tr>
           </thead>
           <tbody></tbody>
+          <tfoot></tfoot>
         </table>
       </div>
     </section>
   </div>
 
+  <button type="button" class="fab" id="fab" aria-label="Add transaction"><i class="fas fa-plus"></i></button>
+
+  <!-- Review transactions read from a bank statement PDF -->
+  <div class="modal" id="importModal" role="dialog" aria-modal="true" aria-labelledby="importTitle">
+    <div class="modal-content import-content">
+      <span class="close" id="closeImport" role="button" tabindex="0" aria-label="Close"><i class="fas fa-times"></i></span>
+      <div class="chart-title" id="importTitle">Review statement</div>
+      <p class="import-note"><i class="fas fa-lock"></i> Read on this device only — the PDF is never uploaded. Check the list, then add.</p>
+      <div class="import-controls">
+        <label><div>Bank / Card</div><select id="importBank"></select></label>
+        <label><div>Purchased By</div><select id="importPerson"></select></label>
+        <button type="button" class="pill-btn ghost" id="importFlip"><i class="fas fa-right-left"></i> Swap expense / income</button>
+      </div>
+      <div class="import-summary" id="importSummary"></div>
+      <div class="import-problems" id="importProblems"></div>
+      <div class="table-container import-table-wrap">
+        <table id="importTable">
+          <thead>
+            <tr>
+              <th class="sel-col"><input type="checkbox" id="importAll" aria-label="Select all"></th>
+              <th>Date</th>
+              <th>Description</th>
+              <th class="right">Amount</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="entry-actions">
+        <button type="button" class="pill-btn ghost" id="importCancel">Cancel</button>
+        <button type="button" class="add-entry-btn primary" id="importConfirm"><i class="fas fa-check"></i> Add</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Edit transaction -->
+  <div class="modal" id="editModal" role="dialog" aria-modal="true" aria-labelledby="editTitle">
+    <div class="modal-content edit-content" id="editCard" data-type="D">
+      <span class="close" id="closeEdit" role="button" tabindex="0" aria-label="Close"><i class="fas fa-times"></i></span>
+      <div class="chart-title" id="editTitle">Edit transaction</div>
+      <div class="type-toggle" role="radiogroup" aria-label="Transaction type" data-target="editType">
+        <button type="button" role="radio" class="type-opt" data-type="D" aria-checked="true"><i class="fas fa-arrow-trend-down"></i> Expense</button>
+        <button type="button" role="radio" class="type-opt" data-type="C" aria-checked="false"><i class="fas fa-arrow-trend-up"></i> Income</button>
+      </div>
+      <input type="hidden" id="editType" value="D">
+      <div class="controls">
+      <div class="grid entry-grid" id="editGrid">
+        <label class="field-amount"><div>Amount</div>
+          <div class="amount-input"><span class="amount-cur" aria-hidden="true">$</span><input type="number" id="editAmount" step="0.01" min="0.01" inputmode="decimal" aria-describedby="editAmountError"></div>
+          <div class="field-error" id="editAmountError" aria-live="polite"></div>
+        </label>
+        <label class="field-store"><div>Store / Description</div>
+          <input type="text" id="editStore" list="storeSuggestions" autocomplete="off" maxlength="120">
+        </label>
+        <label class="field-date"><div>Date</div>
+          <input type="date" id="editDate" aria-describedby="editDateError">
+          <div class="date-chips" data-target="editDate">
+            <button type="button" class="chip" data-offset="0">Today</button>
+            <button type="button" class="chip" data-offset="-1">Yesterday</button>
+          </div>
+          <div class="field-error" id="editDateError" aria-live="polite"></div>
+        </label>
+        <label class="category-field cat-wrap"><div>Category</div>
+          <select id="editCategory" class="sr-select" tabindex="-1" aria-hidden="true"></select>
+          <button type="button" class="category-picker-btn" aria-haspopup="listbox" aria-expanded="false">
+            <span id="editCategoryLabel">Auto-detect</span>
+            <i class="fas fa-chevron-down"></i>
+          </button>
+          <div id="editCategoryPanel" class="category-picker-panel" hidden></div>
+        </label>
+        <label><div>Purchased By</div><select id="editPerson"></select></label>
+        <label><div>Bank / Card</div><select id="editBank"></select></label>
+      </div>
+      <div class="entry-actions edit-actions">
+        <button type="button" class="pill-btn ghost danger" id="editDelete"><i class="fas fa-trash"></i> Delete</button>
+        <button type="button" class="pill-btn ghost" id="editDuplicate"><i class="fas fa-copy"></i> Duplicate</button>
+        <span class="spacer"></span>
+        <button type="button" class="pill-btn ghost" id="editCancel">Cancel</button>
+        <button type="button" class="add-entry-btn primary" id="editSave"><i class="fas fa-check"></i> Save</button>
+      </div>
+      </div>
+    </div>
+  </div>
+
   <footer class="app-footer">
     <div class="brand">Moneta<span class="tm">™</span></div>
-    <div>© <span id="footerYear"></span> Harsha Karuturi. All rights reserved.</div>
+    <div>© <span id="footerYear"></span> Harsha Karuturi · <a href="LICENSE" target="_blank" rel="noopener">MIT License</a></div>
   </footer>
 
 </div>
@@ -233,102 +399,104 @@
 </div>
 
 <!-- Settings Modal -->
-<div id="settingsModal" class="modal">
-  <div class="modal-content" style="max-width: 700px;">
-    <span class="close" id="closeSettings"><i class="fas fa-times"></i></span>
-    <div class="chart-title">Settings</div>
-    
-    <div class="dashboard" style="grid-template-columns: 1fr 1fr; gap: 15px;">
-      <div class="section-card" style="padding: 15px; grid-column: span 2;">
-        <div class="section-header" style="font-size: 0.9em;"><i class="fas fa-coins"></i> Currency</div>
-        <select id="currencySelect" onchange="setCurrencySetting(this.value)" style="padding: 8px; width: 100%;" aria-label="Currency">
+<div id="settingsModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+  <div class="modal-content settings-content">
+    <span class="close" id="closeSettings" role="button" tabindex="0" aria-label="Close"><i class="fas fa-times"></i></span>
+    <div class="chart-title" id="settingsTitle">Settings</div>
+
+    <div class="settings-grid">
+      <section class="settings-card">
+        <h3><i class="fas fa-users"></i> People</h3>
+        <div class="settings-add">
+          <input type="text" id="newPersonName" placeholder="Add a name" maxlength="40" aria-label="New person name">
+          <button type="button" class="add-btn" aria-label="Add person" data-action="addSettingItem" data-key="people" data-input="newPersonName"><i class="fas fa-plus"></i></button>
+        </div>
+        <div id="peopleList" class="chip-list"></div>
+      </section>
+
+      <section class="settings-card">
+        <h3><i class="fas fa-building-columns"></i> Banks &amp; cards</h3>
+        <div class="settings-add">
+          <input type="text" id="newBankName" placeholder="Add a bank or card" maxlength="40" aria-label="New bank name">
+          <button type="button" class="add-btn" aria-label="Add bank" data-action="addSettingItem" data-key="banks" data-input="newBankName"><i class="fas fa-plus"></i></button>
+        </div>
+        <div id="banksList" class="chip-list"></div>
+      </section>
+
+      <section class="settings-card wide">
+        <h3><i class="fas fa-bullseye"></i> Monthly budgets</h3>
+        <p class="settings-help">Pick a category, a group (e.g. "Food &amp; Dining"), or any store name.</p>
+        <div class="settings-add">
+          <input type="text" id="budgetTarget" placeholder="Category, group or store" list="budgetTargets" maxlength="60" aria-label="Budget category">
+          <input type="number" id="budgetAmount" placeholder="Limit $" min="0.01" step="0.01" inputmode="decimal" class="narrow" aria-label="Monthly limit">
+          <button type="button" class="add-btn" aria-label="Add budget" data-action="addBudgetSetting"><i class="fas fa-plus"></i></button>
+        </div>
+        <datalist id="budgetTargets"></datalist>
+        <div id="budgetsList" class="settings-list"></div>
+      </section>
+
+      <section class="settings-card wide">
+        <h3><i class="fas fa-tags"></i> Custom categories</h3>
+        <p class="settings-help">Stores containing a keyword are filed under your category automatically.</p>
+        <div class="settings-add">
+          <input type="text" id="newCategoryName" placeholder="Category name" maxlength="40" aria-label="Category name">
+          <input type="text" id="newCategoryKeywords" placeholder="Keywords, comma separated (e.g. vet, petsmart)" class="grow" aria-label="Keywords">
+          <button type="button" class="add-btn" aria-label="Add category" data-action="addCategorySetting"><i class="fas fa-plus"></i></button>
+        </div>
+        <div id="categoriesList" class="settings-list"></div>
+      </section>
+
+      <section class="settings-card wide">
+        <h3><i class="fas fa-calendar-check"></i> Recurring transactions</h3>
+        <p class="settings-help">Added for the current month when you press <strong>Recurring</strong>. Day 31 uses the month's last day.</p>
+        <div class="recurring-form">
+          <input type="text" id="recDesc" placeholder="Description" maxlength="120" aria-label="Description">
+          <input type="number" id="recAmount" placeholder="Amount" min="0.01" step="0.01" inputmode="decimal" aria-label="Amount">
+          <input type="number" id="recDay" placeholder="Day 1–31" min="1" max="31" step="1" inputmode="numeric" aria-label="Day of month">
+          <select id="recPayer" aria-label="Purchased by"></select>
+          <select id="recBank" aria-label="Bank"></select>
+          <select id="recType" aria-label="Type">
+            <option value="D">Expense</option>
+            <option value="C">Income</option>
+          </select>
+          <button type="button" class="add-btn" aria-label="Add recurring transaction" data-action="addRecurringSetting"><i class="fas fa-plus"></i></button>
+        </div>
+        <div id="recurringList" class="settings-list"></div>
+      </section>
+
+      <section class="settings-card">
+        <h3><i class="fas fa-coins"></i> Currency</h3>
+        <select id="currencySelect" aria-label="Currency">
           <option value="dollar">$ — Dollar</option>
           <option value="inr">₹ — Indian Rupee (INR)</option>
         </select>
-      </div>
+      </section>
 
-      <div class="section-card" style="padding: 15px;">
-        <div class="section-header" style="font-size: 0.9em;"><i class="fas fa-users"></i> Manage People</div>
-        <div style="display: flex; gap: 5px; margin-bottom: 10px;">
-          <input type="text" id="newPersonName" placeholder="Name" style="padding: 8px;">
-          <button class="action-btn primary" aria-label="Add person" onclick="addSettingItem('people', 'newPersonName')" style="width: 35px; height: 35px;"><i class="fas fa-plus"></i></button>
-        </div>
-        <div id="peopleList" style="max-height: 150px; overflow-y: auto; font-size: 14px;"></div>
-      </div>
-
-      <div class="section-card" style="padding: 15px;">
-        <div class="section-header" style="font-size: 0.9em;"><i class="fas fa-university"></i> Manage Banks</div>
-        <div style="display: flex; gap: 5px; margin-bottom: 10px;">
-          <input type="text" id="newBankName" placeholder="Bank Name" style="padding: 8px;">
-          <button class="action-btn primary" aria-label="Add bank" onclick="addSettingItem('banks', 'newBankName')" style="width: 35px; height: 35px;"><i class="fas fa-plus"></i></button>
-        </div>
-        <div id="banksList" style="max-height: 150px; overflow-y: auto; font-size: 14px;"></div>
-      </div>
-
-      <div class="section-card" style="padding: 15px; grid-column: span 2;">
-        <div class="section-header" style="font-size: 0.9em;"><i class="fas fa-bullseye"></i> Monthly Budgets</div>
-        <div style="display: flex; gap: 5px; margin-bottom: 10px;">
-          <input type="text" id="budgetTarget" placeholder="Category or Store Name" style="padding: 8px;">
-          <input type="number" id="budgetAmount" placeholder="Limit $" min="0" inputmode="decimal" style="padding: 8px; width: 100px;">
-          <button class="action-btn primary" aria-label="Add budget" onclick="addBudgetSetting()" style="width: 35px; height: 35px;"><i class="fas fa-plus"></i></button>
-        </div>
-        <div id="budgetsList" class="budget-progress-container" style="font-size: 13px;"></div>
-      </div>
-
-      <div class="section-card" style="padding: 15px; grid-column: span 2;">
-        <div class="section-header" style="font-size: 0.9em;"><i class="fas fa-tags"></i> Custom Categories</div>
-        <div style="display: flex; gap: 5px; margin-bottom: 10px; flex-wrap: wrap;">
-          <input type="text" id="newCategoryName" placeholder="Category name" style="padding: 8px; flex: 1; min-width: 120px;">
-          <input type="text" id="newCategoryKeywords" placeholder="Keywords, comma separated (e.g. vet, petsmart)" style="padding: 8px; flex: 2; min-width: 180px;">
-          <button class="action-btn primary" aria-label="Add category" onclick="addCategorySetting()" style="width: 35px; height: 35px;"><i class="fas fa-plus"></i></button>
-        </div>
-        <div id="categoriesList" style="max-height: 150px; overflow-y: auto; font-size: 14px;"></div>
-      </div>
-
-      <div class="section-card" style="padding: 15px; grid-column: span 2;">
-        <div class="section-header" style="font-size: 0.9em;"><i class="fas fa-calendar-check"></i> Recurring Transactions</div>
-        <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; margin-bottom: 10px;">
-          <input type="text" id="recDesc" placeholder="Description" style="padding: 6px;">
-          <input type="number" id="recAmount" placeholder="Amount" style="padding: 6px;">
-          <input type="number" id="recDay" placeholder="Day (1-31)" style="padding: 6px;">
-          <select id="recPayer" style="padding: 6px;"></select>
-          <select id="recBank" style="padding: 6px;"></select>
-          <select id="recType" style="padding: 6px;">
-            <option value="D">Debit</option>
-            <option value="C">Credit</option>
-          </select>
-          <button class="action-btn primary" aria-label="Add recurring transaction" onclick="addRecurringSetting()" style="height: 35px; width: 100%;"><i class="fas fa-plus"></i></button>
-        </div>
-        <div id="recurringList" style="max-height: 200px; overflow-y: auto; font-size: 13px;"></div>
-      </div>
-
-    </div>
-    <div style="margin-top: 20px; padding-top: 15px; border-top: 1px solid var(--border-color); text-align: center;">
-      <button class="action-btn ghost" onclick="resetAllLocalData()" style="width: auto; padding: 10px 20px; color: var(--danger-color); border-color: var(--danger-color);">
-        <i class="fas fa-trash-alt"></i> Reset All Settings
-      </button>
-    </div>
-    <div style="text-align: center; color: #777; font-size: 12px; margin-top: 10px;">
-      <i class="fas fa-info-circle"></i> These options will update the dropdowns in your entry form.
+      <section class="settings-card">
+        <h3><i class="fas fa-rotate-left"></i> Reset</h3>
+        <p class="settings-help">Restores default people, banks and categories. Your transactions are not touched.</p>
+        <button type="button" class="pill-btn ghost danger" data-action="resetAllLocalData"><i class="fas fa-trash-alt"></i> Reset all settings</button>
+      </section>
     </div>
   </div>
 </div>
 
 <!-- Compare Months Modal -->
-<div id="compareMonthsModal" class="modal">
-  <div class="modal-content">
-    <span class="close" id="closeCompareMonths"><i class="fas fa-times"></i></span>
-    <div class="chart-title">Compare Months</div>
-    <div id="comparisonSummary" class="totals" style="margin-bottom: 25px; display: none;">
-      <div class="pill"><span class="label">Total Expenses</span><span class="value" id="compareTotalExpense">$0.00</span></div>
-      <div class="pill"><span class="label">Total Income</span><span class="value" id="compareTotalIncome">$0.00</span></div>
-      <div class="pill"><span class="label">Total Savings</span><span class="value" id="compareTotalSavings">$0.00</span></div>
+<div id="compareMonthsModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="compareTitle">
+  <div class="modal-content compare-content">
+    <span class="close" id="closeCompareMonths" role="button" tabindex="0" aria-label="Close"><i class="fas fa-times"></i></span>
+    <div class="chart-title" id="compareTitle">Compare months</div>
+    <p class="settings-help center">Pick several monthly Excel files to see them side by side. Nothing is added to your list.</p>
+    <div class="compare-pick">
+      <label class="pill-btn primary file-upload-btn">
+        <i class="fas fa-file-circle-plus"></i> <span>Choose Excel files</span>
+        <input type="file" id="compareFilesInput" accept=".xlsx,.xls" multiple>
+      </label>
     </div>
-    <div style="display: flex; justify-content: center; margin-bottom: 20px;">
-       <label class="action-btn ghost" style="width: auto; padding: 12px 24px; display: flex; align-items: center; gap: 10px;">
-          <i class="fas fa-file-medical"></i> Select Excel Files to Compare
-          <input type="file" id="compareFilesInput" accept=".xlsx,.xls" multiple style="display: none;">
-       </label>
+    <div id="comparisonSummary" class="kpi-grid compare-kpis" style="display: none;">
+      <div class="kpi"><span class="kpi-label">Spent</span><span class="kpi-value value-expense" id="compareTotalExpense">$0.00</span></div>
+      <div class="kpi"><span class="kpi-label">Income</span><span class="kpi-value value-income" id="compareTotalIncome">$0.00</span></div>
+      <div class="kpi"><span class="kpi-label">Saved</span><span class="kpi-value" id="compareTotalSavings">$0.00</span></div>
     </div>
     <div class="chart-container">
       <canvas id="compareMonthsChart"></canvas>
@@ -336,6 +504,7 @@
   </div>
 </div>
 
-<script src="app.js?v=20260822"></script>
+<script src="app.js?v=20261102"></script>
+<script src="statement-import.js?v=20261102"></script>
 </body>
 </html>

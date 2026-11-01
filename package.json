@@ -1,0 +1,16 @@
+{
+  "name": "moneta",
+  "version": "3.0.0",
+  "private": true,
+  "description": "Personal expense tracker — runs entirely in the browser.",
+  "license": "MIT",
+  "author": "Harsha Karuturi",
+  "scripts": {
+    "test": "node tests.js",
+    "test:e2e": "node tests/e2e.js"
+  },
+  "devDependencies": {
+    "pdf-lib": "^1.17.1",
+    "puppeteer": "^25.16.0"
+  }
+}

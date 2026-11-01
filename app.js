@@ -1,5 +1,10 @@
   let budgetData = [];
-  let inlineEditIndex = -1;
+  let editIndex = -1;              // row open in the edit dialog
+  const selectedRows = new Set();  // rows ticked for bulk actions
+  let unsavedCount = 0;            // changes since the last open/save
+  // The file the data came from: { name, months, handle, workbook }.
+  // Saving writes its months back into it; other months get their own files.
+  let source = null;
 
   // Currency display: a generic dollar sign by default, with INR as an option.
   const CURRENCIES = {
@@ -16,6 +21,9 @@
     document.getElementById('filterMinAmount').placeholder = `Min ${activeCurrency.symbol}`;
     document.getElementById('filterMaxAmount').placeholder = `Max ${activeCurrency.symbol}`;
     document.getElementById('budgetAmount').placeholder = `Limit ${activeCurrency.symbol}`;
+    document.querySelectorAll('.amount-cur').forEach(el => { el.textContent = activeCurrency.symbol; });
+    const currencySelect = document.getElementById('currencySelect');
+    if (currencySelect) currencySelect.value = getSettings().currency;
   }
 
   function fmtMoney(v) {
@@ -261,7 +269,8 @@
       menuOptions.classList.remove('show');
       menuBtn.setAttribute('aria-expanded', 'false');
       closeCategoryPickers();
-      if (inlineEditIndex > -1) cancelInlineEdit();
+      editIndex = -1;
+      closeEntrySheet();
     }
   });
 
@@ -283,10 +292,24 @@
 
   // Category groups → sub-categories → keywords. Group order matters:
   // matching walks top to bottom, so broad catch-alls (Shopping) come last.
+  const TRANSFER_GROUP = 'Transfers & Savings';
+  let categoryCache = null; // rebuilt whenever settings change
+
+  function invalidateCategoryCache() {
+    categoryCache = null;
+  }
+
   function getCategoryGroups() {
+    if (categoryCache && categoryCache.groups) return categoryCache.groups;
     const groups = {
       'Income': {
-        'Income': ['payroll', 'salary', 'deposit', 'income', 'interest', 'intrest', 'refund', 'cashback', 'rebate']
+        'Income': ['payroll', 'salary', 'deposit', 'income', 'interest', 'intrest', 'cashback', 'rebate']
+      },
+      // Money moving between your own accounts — never counted as spending or income
+      [TRANSFER_GROUP]: {
+        'Credit Card Payment': ['credit card', 'card payment', 'payment thank you', 'payment - thank you', 'payment received', 'autopay'],
+        'Transfer': ['own account', 'between accounts', 'internal transfer', 'account transfer', 'tfr'],
+        'Investment': ['investment', 'stocks', 'etf', 'crypto', 'rrsp', 'tfsa', 'fhsa', 'mutual fund', 'wealthsimple invest', 'questrade']
       },
       'Housing': {
         'Rent': ['rent', 'apartment', 'housing', 'lease'],
@@ -295,7 +318,6 @@
       'Bills & Utilities': {
         'Phone & Internet': ['phone', 'internet', 'wifi', 'mobile', 'rogers', 'bell canada', 'bell mobility', 'telus', 'fido', 'koodo', 'freedom mobile', 'cable tv'],
         'Utilities': ['utility', 'utilities', 'hydro', 'electricity', 'electric bill', 'power bill', 'water', 'gas bill', 'natural gas', 'enbridge', 'heating'],
-        'Credit Card Payment': ['credit card', 'card payment'],
         'Subscriptions': ['subscription', 'membership', 'prime', 'spotify', 'icloud', 'youtube premium', 'google one', 'disney'],
         'Bills': ['bill', 'bills']
       },
@@ -317,7 +339,6 @@
       'Financial': {
         'Loans': ['loan', 'loans', 'car loan', 'car payment', 'mortgage', 'emi', 'repayment'],
         'Insurance': ['insurance', 'premium'],
-        'Investment': ['investment', 'stocks', 'etf', 'crypto', 'rrsp', 'tfsa', 'mutual fund', 'wealthsimple'],
         'Taxes & Fees': ['tax', 'taxes', 'cra', 'fine', 'penalty', 'service charge']
       },
       'Work & Education': {
@@ -338,6 +359,7 @@
     };
     const custom = getSettings().categories || {};
     if (Object.keys(custom).length) groups['Custom'] = custom;
+    categoryCache = { groups, map: null, groupOf: new Map(), storeCat: new Map() };
     return groups;
   }
 
@@ -346,21 +368,27 @@
   // re-applied last so same-named custom categories override default keywords.
   function getCategoryMap() {
     const groups = getCategoryGroups();
+    if (categoryCache.map) return categoryCache.map;
     const custom = groups['Custom'] || {};
     const flat = { ...custom };
     for (const [group, subs] of Object.entries(groups)) {
       if (group === 'Custom') continue;
       Object.assign(flat, subs);
     }
-    return Object.assign(flat, custom);
+    categoryCache.map = Object.assign(flat, custom);
+    return categoryCache.map;
   }
 
   // Which group a sub-category belongs to (e.g. 'Utilities' → 'Bills & Utilities')
   function getCategoryGroup(category) {
-    for (const [group, subs] of Object.entries(getCategoryGroups())) {
-      if (subs[category] !== undefined) return group;
+    const groups = getCategoryGroups();
+    if (categoryCache.groupOf.has(category)) return categoryCache.groupOf.get(category);
+    let found = null;
+    for (const [group, subs] of Object.entries(groups)) {
+      if (Object.prototype.hasOwnProperty.call(subs, category)) { found = group; break; }
     }
-    return null;
+    categoryCache.groupOf.set(category, found);
+    return found;
   }
 
   // Manage People and Banks Settings
@@ -373,12 +401,29 @@
       categories: {}, // { "Pets": ["vet", "petsmart"] }
       currency: 'dollar' // 'dollar' (generic $) or 'inr' (₹)
     };
-    const stored = localStorage.getItem('spendwise_settings');
-    return stored ? JSON.parse(stored) : defaultSettings;
+    let stored = null;
+    try { stored = JSON.parse(localStorage.getItem('spendwise_settings')); } catch (e) { /* corrupted — use defaults */ }
+    if (!stored || typeof stored !== 'object') return defaultSettings;
+    const isPlainObject = v => v && typeof v === 'object' && !Array.isArray(v);
+    return {
+      people: Array.isArray(stored.people) ? stored.people.map(String) : defaultSettings.people,
+      banks: Array.isArray(stored.banks) ? stored.banks.map(String) : defaultSettings.banks,
+      budgets: isPlainObject(stored.budgets) ? stored.budgets : {},
+      recurring: Array.isArray(stored.recurring) ? stored.recurring.filter(isPlainObject) : [],
+      categories: isPlainObject(stored.categories) ? stored.categories : {},
+      currency: CURRENCIES[stored.currency] ? stored.currency : defaultSettings.currency
+    };
+  }
+
+  // Names used as object keys (budgets, categories) must not be able to
+  // reach Object.prototype
+  function isSafeKey(name) {
+    return !['__proto__', 'constructor', 'prototype'].includes(name);
   }
 
   function saveSettings(settings) {
     localStorage.setItem('spendwise_settings', JSON.stringify(settings));
+    invalidateCategoryCache();
   }
 
   function setCurrencySetting(code) {
@@ -416,7 +461,14 @@
   function addBudgetSetting() {
     const target = document.getElementById('budgetTarget').value.trim();
     const amount = parseFloat(document.getElementById('budgetAmount').value);
-    if (!target || isNaN(amount)) return;
+    if (!target || !isSafeKey(target)) {
+      showStatus('⚠️ Enter a category, group, or store name for the budget.', true);
+      return;
+    }
+    if (!isFinite(amount) || amount <= 0) {
+      showStatus('⚠️ Budget limit must be more than zero.', true);
+      return;
+    }
     const settings = getSettings();
     settings.budgets[target] = amount;
     saveSettings(settings);
@@ -428,7 +480,7 @@
     const name = document.getElementById('newCategoryName').value.trim();
     const keywords = document.getElementById('newCategoryKeywords').value
       .split(',').map(k => k.trim().toLowerCase()).filter(Boolean);
-    if (!name || keywords.length === 0) {
+    if (!name || keywords.length === 0 || !isSafeKey(name)) {
       showStatus('⚠️ Enter a category name and at least one keyword.', true);
       return;
     }
@@ -457,8 +509,11 @@
   function addRecurringSetting() {
     const desc = document.getElementById('recDesc').value.trim();
     const amount = parseFloat(document.getElementById('recAmount').value);
-    const day = parseInt(document.getElementById('recDay').value);
-    if (!desc || isNaN(amount) || isNaN(day)) return;
+    const day = parseInt(document.getElementById('recDay').value, 10);
+    if (!desc || !isFinite(amount) || amount <= 0 || !(day >= 1 && day <= 31)) {
+      showStatus('⚠️ Recurring needs a description, an amount above zero, and a day from 1 to 31.', true);
+      return;
+    }
     
     const settings = getSettings();
     settings.recurring.push({
@@ -479,33 +534,37 @@
     const recList = document.getElementById('recurringList');
     const catList = document.getElementById('categoriesList');
     
-    pList.innerHTML = settings.people.map((p, i) =>
-      `<div style="display:flex; justify-content:space-between; align-items:center; padding:5px; border-bottom:1px solid var(--border-color);">
-        ${escapeHtml(p)} <button class="list-remove-btn" aria-label="Remove ${escapeHtml(p)}" onclick="removeSettingItem('people', ${i})"><i class="fas fa-times"></i></button>
-      </div>`).join('');
+    const chip = (label, attrs) =>
+      `<span class="chip-item">${escapeHtml(label)}<button type="button" class="list-remove-btn" aria-label="Remove ${escapeHtml(label)}" ${attrs}><i class="fas fa-times"></i></button></span>`;
+    const line = (main, sub, label, attrs) =>
+      `<div class="settings-line"><div><strong>${main}</strong>${sub ? `<span>${sub}</span>` : ''}</div>` +
+      `<button type="button" class="list-remove-btn" aria-label="Remove ${escapeHtml(label)}" ${attrs}><i class="fas fa-times"></i></button></div>`;
+    const empty = text => `<div class="settings-empty">${text}</div>`;
 
+    pList.innerHTML = settings.people.map((p, i) =>
+      chip(p, `data-action="removeSettingItem" data-key="people" data-index="${i}"`)).join('') || empty('No people yet.');
     bList.innerHTML = settings.banks.map((b, i) =>
-      `<div style="display:flex; justify-content:space-between; align-items:center; padding:5px; border-bottom:1px solid var(--border-color);">
-        ${escapeHtml(b)} <button class="list-remove-btn" aria-label="Remove ${escapeHtml(b)}" onclick="removeSettingItem('banks', ${i})"><i class="fas fa-times"></i></button>
-      </div>`).join('');
+      chip(b, `data-action="removeSettingItem" data-key="banks" data-index="${i}"`)).join('') || empty('No banks yet.');
 
     budList.innerHTML = Object.entries(settings.budgets).map(([k, v], i) =>
-      `<div class="budget-item" style="display:flex; justify-content:space-between; align-items:center;">
-        <span><strong>${escapeHtml(k)}</strong>: ${fmtMoney(v)}</span>
-        <button class="list-remove-btn" aria-label="Remove budget ${escapeHtml(k)}" onclick="removeBudgetByIndex(${i})"><i class="fas fa-times"></i></button>
-      </div>`).join('');
+      line(escapeHtml(k), `${fmtMoney(v)} / month`, `budget ${k}`, `data-action="removeBudgetByIndex" data-index="${i}"`)).join('') ||
+      empty('No budgets yet.');
 
     recList.innerHTML = settings.recurring.map((r, i) =>
-      `<div style="display:flex; justify-content:space-between; align-items:center; padding:8px; border-bottom:1px solid var(--border-color);">
-        <span>[Day ${r.day}] <strong>${escapeHtml(r.desc)}</strong> - ${fmtMoney(r.amount)} (${escapeHtml(r.payer)})</span>
-        <button class="list-remove-btn" aria-label="Remove recurring ${escapeHtml(r.desc)}" onclick="removeRecurring(${i})"><i class="fas fa-times"></i></button>
-      </div>`).join('');
+      line(escapeHtml(r.desc), `${r.type === 'C' ? 'Income' : 'Expense'} ${fmtMoney(r.amount)} · day ${escapeHtml(r.day)} · ${escapeHtml(r.payer || '')}${r.bank ? ' · ' + escapeHtml(r.bank) : ''}`,
+        `recurring ${r.desc}`, `data-action="removeRecurring" data-index="${i}"`)).join('') ||
+      empty('No recurring transactions yet.');
 
     catList.innerHTML = Object.entries(settings.categories || {}).map(([name, kws], i) =>
-      `<div style="display:flex; justify-content:space-between; align-items:center; padding:5px; border-bottom:1px solid var(--border-color);">
-        <span><strong>${escapeHtml(name)}</strong>: ${escapeHtml(kws.join(', '))}</span>
-        <button class="list-remove-btn" aria-label="Remove category ${escapeHtml(name)}" onclick="removeCategoryByIndex(${i})"><i class="fas fa-times"></i></button>
-      </div>`).join('') || '<div style="color: var(--muted-color); padding: 5px;">No custom categories yet.</div>';
+      line(escapeHtml(name), escapeHtml(kws.join(', ')), `category ${name}`, `data-action="removeCategoryByIndex" data-index="${i}"`)).join('') ||
+      empty('No custom categories yet.');
+
+    // Budget suggestions: every category and group
+    const groups = getCategoryGroups();
+    const names = new Set();
+    Object.entries(groups).forEach(([g, subs]) => { names.add(g); Object.keys(subs).forEach(c => names.add(c)); });
+    document.getElementById('budgetTargets').innerHTML = [...names].sort((a, b) => a.localeCompare(b))
+      .map(n => `<option value="${escapeHtml(n)}"></option>`).join('');
 
     // Sync dropdowns in recurring form
     document.getElementById('recPayer').innerHTML = settings.people.map(p => `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`).join('');
@@ -551,6 +610,7 @@
     if (confirm('Reset all settings (people, banks, budgets, categories, recurring)? Your transaction table is not affected.')) {
       localStorage.removeItem('spendwise_settings');
       localStorage.removeItem('spendwise_data'); // legacy key from older versions
+      invalidateCategoryCache();
       populateSettingsUI();
       updateDropdowns();
       populateCategoryDropdown();
@@ -565,6 +625,7 @@
     document.documentElement.setAttribute('data-theme', newTheme);
     localStorage.setItem('spendwise_theme', newTheme);
     updateThemeUI(newTheme);
+    renderDashboard();
   }
 
   function updateThemeUI(theme) {
@@ -655,6 +716,14 @@
   addBtn.addEventListener('click', addEntry);
   downloadBtn.addEventListener('click', downloadExcel);
   uploadFile.addEventListener('change', uploadExcel);
+  // Where supported, open the file through the File System Access API so we
+  // get a writable handle back; otherwise the plain file input is used.
+  if ('showOpenFilePicker' in window) {
+    uploadFile.closest('label').addEventListener('click', (e) => {
+      e.preventDefault();
+      pickAndLinkExcel();
+    });
+  }
   compareFilesInput.addEventListener('change', uploadMultipleExcel);
   clearBtn.addEventListener('click', clearTable);
   
@@ -694,8 +763,9 @@
     
     let count = 0;
     let skipped = 0;
+    const lastDay = new Date(year, now.getMonth() + 1, 0).getDate();
     settings.recurring.forEach(r => {
-      const day = String(r.day).padStart(2, '0');
+      const day = String(Math.min(Math.max(parseInt(r.day, 10) || 1, 1), lastDay)).padStart(2, '0');
       const date = `${year}-${month}-${day}`;
       // Skip if this recurring entry was already applied this month
       const exists = budgetData.some(b =>
@@ -721,6 +791,7 @@
       return;
     }
 
+    markChanged(count);
     renderTable();
     showStatus(`✅ Applied ${count} recurring transaction${count > 1 ? 's' : ''}${skipped ? ` (${skipped} already present)` : ''}.`);
   }
@@ -834,39 +905,107 @@
     }, undoFn ? 6000 : 4000);
   }
 
-  function addEntry() {
-    const date = document.getElementById('date').value;
-    const purchasedBy = document.getElementById('purchasedBy').value || '';
-    const store = document.getElementById('store').value || '';
-    const bank = document.getElementById('bank').value || '';
-    const type = document.getElementById('type').value;
-    const category = document.getElementById('category').value;
-    const amountVal = document.getElementById('amount').value;
-    const amount = amountVal === '' ? NaN : parseFloat(amountVal);
+  // Shows (or clears) the message under a field
+  function setFieldError(id, message) {
+    const el = document.getElementById(id);
+    el.textContent = message || '';
+    const field = el.closest('label');
+    if (field) field.classList.toggle('has-error', !!message);
+  }
 
-    if (!date || isNaN(amount) || amount < 0) {
-      showStatus('⚠️ Please enter valid Date and Amount (must be positive).', true);
-      return;
+  // Reads one of the transaction forms (Add or Edit) into a row object,
+  // or returns null after showing what's wrong
+  function readEntryForm(f) {
+    const date = document.getElementById(f.date).value;
+    const amountVal = document.getElementById(f.amount).value;
+    const amount = amountVal === '' ? NaN : Number(amountVal);
+    let ok = true;
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      setFieldError(f.dateError, 'Pick a date');
+      ok = false;
+    } else setFieldError(f.dateError, '');
+
+    if (!isFinite(amount) || amount <= 0) {
+      setFieldError(f.amountError, amountVal === '' ? 'Enter an amount' : 'Amount must be more than 0');
+      ok = false;
+    } else if (amount >= 1e9) {
+      setFieldError(f.amountError, 'That amount looks too large');
+      ok = false;
+    } else setFieldError(f.amountError, '');
+
+    if (!ok) {
+      document.getElementById(isFinite(amount) && amount > 0 ? f.date : f.amount).focus();
+      return null;
     }
 
-    const debit = type === 'D' ? amount : '';
-    const credit = type === 'C' ? amount : '';
-
+    const value = toCents(amount) / 100; // store exactly 2 decimals
+    const type = document.getElementById(f.type).value;
     const entry = {
       'Date': date,
-      'Purchased By': purchasedBy,
-      'Purchased Store': store,
-      'Bank Name': bank,
-      'Debit [D]': debit,
-      'Credit [C]': credit,
-      'Amount Total': amount
+      'Purchased By': document.getElementById(f.person).value || '',
+      'Purchased Store': document.getElementById(f.store).value.trim(),
+      'Bank Name': document.getElementById(f.bank).value || '',
+      'Debit [D]': type === 'C' ? '' : value,
+      'Credit [C]': type === 'C' ? value : '',
+      'Amount Total': value
     };
+    const category = document.getElementById(f.category).value;
     if (category) entry['Category'] = category;
+    return entry;
+  }
+
+  const ADD_FORM = {
+    date: 'date', amount: 'amount', type: 'type', person: 'purchasedBy', store: 'store',
+    bank: 'bank', category: 'category', dateError: 'dateError', amountError: 'amountError'
+  };
+  const EDIT_FORM = {
+    date: 'editDate', amount: 'editAmount', type: 'editType', person: 'editPerson', store: 'editStore',
+    bank: 'editBank', category: 'editCategory', dateError: 'editDateError', amountError: 'editAmountError'
+  };
+
+  function confirmIfDuplicate(entry, skipIndex) {
+    const i = findDuplicate(budgetData, entry, skipIndex);
+    if (i < 0) return true;
+    const store = entry['Purchased Store'] || 'this transaction';
+    return confirm(`${store} for ${fmtMoney(entry['Amount Total'])} on ${entry['Date']} is already in your list.\n\nAdd it again anyway?`);
+  }
+
+  function addEntry() {
+    const entry = readEntryForm(ADD_FORM);
+    if (!entry || !confirmIfDuplicate(entry, -1)) return;
 
     budgetData.push(entry);
-    showStatus('✅ Entry added successfully!');
+    rememberLastUsed(entry);
+    markChanged();
+    dashPinned = null; // jump the overview to the month just added to
     renderTable();
     resetForm();
+    if (isPhone()) closeEntrySheet();
+    const kind = entry['Credit [C]'] !== '' ? 'Income' : 'Expense';
+    showStatus(`✅ ${kind} of ${fmtMoney(entry['Amount Total'])} added`, false, () => {
+      const i = budgetData.indexOf(entry);
+      if (i > -1) budgetData.splice(i, 1);
+      markChanged();
+      renderTable();
+      showStatus('↩️ Entry removed.');
+    });
+  }
+
+  // Person and bank stay on what you used last, so repeat entries are quicker
+  function rememberLastUsed(entry) {
+    try {
+      localStorage.setItem('spendwise_last', JSON.stringify({ person: entry['Purchased By'], bank: entry['Bank Name'] }));
+    } catch (e) { /* storage unavailable */ }
+  }
+
+  function applyLastUsed() {
+    let last = null;
+    try { last = JSON.parse(localStorage.getItem('spendwise_last')); } catch (e) { /* ignore */ }
+    if (!last) return;
+    const settings = getSettings();
+    if (settings.people.includes(last.person)) document.getElementById('purchasedBy').value = last.person;
+    if (settings.banks.includes(last.bank)) document.getElementById('bank').value = last.bank;
   }
 
   function todayStr() {
@@ -879,7 +1018,94 @@
     document.getElementById('store').value = '';
     document.getElementById('category').value = '';
     document.getElementById('date').value = todayStr();
+    document.getElementById('storeHint').textContent = '';
+    setFieldError('amountError', '');
+    setFieldError('dateError', '');
+    syncDateChips();
     updateCategoryHint();
+  }
+
+  function dateOffsetStr(days) {
+    const d = new Date();
+    d.setDate(d.getDate() + days);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
+  // Highlights the Today/Yesterday chip that matches the date field
+  function syncDateChips() {
+    document.querySelectorAll('.date-chips').forEach(group => {
+      const value = document.getElementById(group.dataset.target).value;
+      group.querySelectorAll('.chip').forEach(chip => {
+        chip.classList.toggle('active', value === dateOffsetStr(Number(chip.dataset.offset)));
+      });
+    });
+  }
+
+  function setEntryType(toggle, type) {
+    document.getElementById(toggle.dataset.target).value = type;
+    toggle.querySelectorAll('.type-opt').forEach(b => b.setAttribute('aria-checked', String(b.dataset.type === type)));
+    toggle.parentElement.closest('[data-type]').dataset.type = type;
+    if (toggle.dataset.target === 'type') {
+      document.getElementById('addBtnLabel').textContent = type === 'C' ? 'Add income' : 'Add expense';
+    }
+  }
+
+  function isPhone() {
+    return window.matchMedia('(max-width: 600px)').matches;
+  }
+
+  function openEntrySheet() {
+    document.getElementById('entryCard').classList.add('sheet-open');
+    document.getElementById('sheetBackdrop').hidden = false;
+    document.body.classList.add('sheet-locked');
+    setTimeout(() => document.getElementById('amount').focus(), 50);
+  }
+
+  function closeEntrySheet() {
+    document.getElementById('entryCard').classList.remove('sheet-open');
+    document.getElementById('sheetBackdrop').hidden = true;
+    document.body.classList.remove('sheet-locked');
+  }
+
+  // Store suggestions come from your own history, most used first
+  function refreshStoreSuggestions() {
+    const stores = new Map();
+    budgetData.forEach(r => {
+      const name = String(r['Purchased Store'] || '').trim();
+      if (!name) return;
+      const key = name.toLowerCase();
+      const cur = stores.get(key) || { name, count: 0 };
+      cur.count++;
+      stores.set(key, cur);
+    });
+    document.getElementById('storeSuggestions').innerHTML = [...stores.values()]
+      .sort((a, b) => b.count - a.count).slice(0, 300)
+      .map(s => `<option value="${escapeHtml(s.name)}"></option>`).join('');
+  }
+
+  // Picking a store you've used before fills person, bank, type and category
+  // from your most recent entry there
+  function autofillFromStore() {
+    const name = document.getElementById('store').value.trim().toLowerCase();
+    const hint = document.getElementById('storeHint');
+    if (!name) { hint.textContent = ''; return; }
+    let last = null;
+    for (let i = budgetData.length - 1; i >= 0; i--) {
+      if (String(budgetData[i]['Purchased Store'] || '').trim().toLowerCase() === name) { last = budgetData[i]; break; }
+    }
+    if (!last) { hint.textContent = ''; return; }
+    const setIfOption = (id, value) => {
+      const sel = document.getElementById(id);
+      if ([...sel.options].some(o => o.value === value)) sel.value = value;
+    };
+    setIfOption('purchasedBy', last['Purchased By']);
+    setIfOption('bank', last['Bank Name']);
+    const isIncome = toCents(last['Credit [C]']) > 0 && !toCents(last['Debit [D]']);
+    setEntryType(document.querySelector('#entryCard .type-toggle'), isIncome ? 'C' : 'D');
+    const catSel = document.getElementById('category');
+    catSel.value = last['Category'] && [...catSel.options].some(o => o.value === last['Category']) ? last['Category'] : '';
+    updateCategoryHint();
+    hint.textContent = '✓ filled from last time';
   }
 
   function populateCategoryDropdown() {
@@ -895,7 +1121,13 @@
         '</optgroup>').join('');
     if ([...sel.options].some(o => o.value === current)) sel.value = current;
 
-    document.getElementById('categoryPickerPanel').innerHTML = buildCategoryPanelHTML();
+    const panelHTML = buildCategoryPanelHTML();
+    document.getElementById('categoryPickerPanel').innerHTML = panelHTML;
+    document.getElementById('editCategoryPanel').innerHTML = panelHTML;
+    document.getElementById('editCategory').innerHTML = sel.innerHTML;
+    document.getElementById('bulkCategory').innerHTML =
+      '<option value="">Choose category…</option><option value="__auto">Auto-detect</option>' +
+      sel.innerHTML.replace('<option value="">Auto-detect</option>', '');
     updateCategoryHint();
   }
 
@@ -953,11 +1185,6 @@
     });
   }
 
-  // Manual category on the entry wins; otherwise guess from keywords
-  function getCategory(row) {
-    return row['Category'] || categorizeStore(row['Purchased Store'] || '');
-  }
-
   // Whole-word keyword matching so 'eat' doesn't hit "Great Clips",
   // 'bus' doesn't hit "business", 'car' doesn't hit "card", etc.
   const keywordRegexCache = new Map();
@@ -973,12 +1200,22 @@
   function categorizeStore(store) {
     const categoryMap = getCategoryMap();
     const storeLower = store.toLowerCase();
+    const cached = categoryCache.storeCat.get(storeLower);
+    if (cached) return cached;
+    let result = 'Other';
     for (const [category, keywords] of Object.entries(categoryMap)) {
       if (keywords.some(keyword => keywordMatches(storeLower, keyword))) {
-        return category;
+        result = category;
+        break;
       }
     }
-    return 'Other';
+    categoryCache.storeCat.set(storeLower, result);
+    return result;
+  }
+
+  // Manual category on the entry wins; otherwise guess from keywords
+  function getCategory(row) {
+    return row['Category'] || categorizeStore(row['Purchased Store'] || '');
   }
 
   function getCategoryBadge(category) {
@@ -1024,7 +1261,13 @@
     // Determine new sort direction
     let direction = 'asc';
     if (currentSort.column === column) {
-      direction = currentSort.direction === 'asc' ? 'desc' : 'asc';
+      if (currentSort.direction === 'desc') {
+        // Third click: back to the default newest-first, grouped-by-day view
+        currentSort = { column: null, direction: 'none' };
+        renderTable();
+        return;
+      }
+      direction = 'desc';
     }
     
     // Update current sort
@@ -1035,9 +1278,6 @@
     const sortIcon = header.querySelector('.sort-icon');
     sortIcon.textContent = direction === 'asc' ? '↑' : '↓';
 
-    // Sorting reorders rows, so leave inline edit mode to keep indices valid
-    inlineEditIndex = -1;
-    
     // Sort the data
     budgetData.sort((a, b) => {
       if (column === 'amount') {
@@ -1074,7 +1314,8 @@
       const matchesSearch = (
         (row['Purchased By'] || '').toLowerCase().includes(searchTerm) ||
         (row['Purchased Store'] || '').toLowerCase().includes(searchTerm) ||
-        (row['Bank Name'] || '').toLowerCase().includes(searchTerm)
+        (row['Bank Name'] || '').toLowerCase().includes(searchTerm) ||
+        getCategory(row).toLowerCase().includes(searchTerm)
       );
 
       const rowDate = row['Date'] || '';
@@ -1087,13 +1328,32 @@
     });
   }
 
-  function renderTable() {
-    const tbody = document.querySelector('#budgetTable tbody');
-    tbody.innerHTML = '';
+  function fmtSigned(cents) {
+    return (cents > 0 ? '+' : cents < 0 ? '−' : '') + fmtMoney(Math.abs(cents) / 100);
+  }
 
-    let totalDebitC = 0;
-    let totalCreditC = 0;
-    let totalAmountC = 0;
+  function dayLabel(dateStr) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return dateStr ? `Date: ${dateStr}` : 'No date';
+    const [y, m, d] = dateStr.split('-').map(Number);
+    const date = new Date(y, m - 1, d);
+    const opts = { weekday: 'short', month: 'short', day: 'numeric' };
+    if (y !== new Date().getFullYear()) opts.year = 'numeric';
+    const label = date.toLocaleDateString(undefined, opts);
+    if (dateStr === todayStr()) return `Today · ${label}`;
+    if (dateStr === dateOffsetStr(-1)) return `Yesterday · ${label}`;
+    return label;
+  }
+
+  function shortDate(dateStr) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return dateStr || '—';
+    const [y, m, d] = dateStr.split('-').map(Number);
+    return new Date(y, m - 1, d).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+  }
+
+  function renderTable() {
+    const table = document.getElementById('budgetTable');
+    const tbody = table.querySelector('tbody');
+    const tfoot = table.querySelector('tfoot');
 
     const filteredData = getFilteredData();
     const filtersActive = searchInput.value !== '' || filterStartDate.value || filterEndDate.value ||
@@ -1102,98 +1362,91 @@
     document.getElementById('rowCount').textContent =
       filtersActive ? `(${filteredData.length} of ${budgetData.length})` : `(${budgetData.length})`;
 
+    // Forget selections for rows that no longer exist
+    const live = new Set(budgetData);
+    [...selectedRows].forEach(r => { if (!live.has(r)) selectedRows.delete(r); });
+    updateBulkBar(filteredData);
+    refreshStoreSuggestions();
+
     if (filteredData.length === 0) {
-      tbody.innerHTML = `<tr class="empty-row"><td colspan="8"><div class="empty-state">
+      table.classList.remove('grouped');
+      tbody.innerHTML = `<tr class="empty-row"><td colspan="7"><div class="empty-state">
         <i class="fas ${filtersActive ? 'fa-filter-circle-xmark' : 'fa-receipt'}"></i>
         <div class="empty-title">${filtersActive ? 'No matching transactions' : 'No transactions yet'}</div>
-        <div class="empty-hint">${filtersActive ? 'Try adjusting or clearing your filters.' : 'Add your first entry above, or upload an Excel file to get started.'}</div>
+        <div class="empty-hint">${filtersActive ? 'Try adjusting or clearing your filters.' : 'Add your first entry above, or open an Excel file to get started.'}</div>
       </div></td></tr>`;
+      tfoot.innerHTML = '';
       updateTotals();
       renderBudgetTracking();
       return;
     }
 
-    const settings = getSettings();
-    // <option> list where the row's current value stays selectable even if
-    // it was removed from Settings since the entry was created
-    const selOpts = (list, current) => {
-      const items = (!current || list.includes(current)) ? list : [current, ...list];
-      return items.map(v => `<option value="${escapeHtml(v)}"${v === current ? ' selected' : ''}>${escapeHtml(v)}</option>`).join('');
-    };
+    const indexOf = new Map(budgetData.map((r, i) => [r, i]));
+    // Default view: newest first, latest-added first within a day
+    let rows = filteredData;
+    if (!currentSort.column) {
+      rows = [...filteredData].sort((a, b) =>
+        String(b['Date'] || '').localeCompare(String(a['Date'] || '')) || indexOf.get(b) - indexOf.get(a));
+    }
+    const grouped = !currentSort.column || currentSort.column === 'date';
+    table.classList.toggle('grouped', grouped);
 
-    filteredData.forEach((row) => {
-      const tr = document.createElement('tr');
-      const debit = Number(row['Debit [D]']) || 0;
-      const credit = Number(row['Credit [C]']) || 0;
-      const amount = Number(row['Amount Total']) || 0;
-
-      // Map back to original index for data integrity
-      const originalIdx = budgetData.indexOf(row);
-
-      totalDebitC += toCents(debit);
-      totalCreditC += toCents(credit);
-      totalAmountC += toCents(amount);
-
-      const category = getCategory(row);
-
-      if (originalIdx === inlineEditIndex) {
-        tr.className = 'editing-row';
-        // Same grouped structure as the main picker: optgroups per group,
-        // single-category groups shown as direct options
-        const cur = row['Category'] || '';
-        const catOpt = c => `<option value="${escapeHtml(c)}"${cur === c ? ' selected' : ''}>${escapeHtml(c)}</option>`;
-        const catOpts = '<option value="">Auto-detect</option>' +
-          Object.entries(getCategoryGroups()).map(([group, subs]) => {
-            const names = Object.keys(subs).sort((a, b) => a.localeCompare(b));
-            if (names.length === 1) return catOpt(names[0]);
-            return `<optgroup label="${escapeHtml(group)}">` + names.map(catOpt).join('') + '</optgroup>';
-          }).join('');
-        tr.innerHTML =
-          `<td><input type="date" class="ie-date" value="${escapeHtml(row['Date'] || '')}"></td>` +
-          `<td><select class="ie-payer">${selOpts(settings.people, row['Purchased By'] || '')}</select></td>` +
-          `<td><input type="text" class="ie-store" value="${escapeHtml(row['Purchased Store'] || '')}" placeholder="Store">` +
-          `<div class="cat-wrap ie-cat-wrap">` +
-          `<select class="ie-category sr-select" tabindex="-1" aria-hidden="true">${catOpts}</select>` +
-          `<button type="button" class="category-picker-btn" aria-haspopup="listbox" aria-expanded="false"><span>${escapeHtml(cur || 'Auto-detect')}</span><i class="fas fa-chevron-down"></i></button>` +
-          `<div class="category-picker-panel" hidden>${buildCategoryPanelHTML()}</div>` +
-          `</div></td>` +
-          `<td><select class="ie-bank">${selOpts(settings.banks, row['Bank Name'] || '')}</select></td>` +
-          `<td class="right"><input type="number" class="ie-debit" step="0.01" min="0" inputmode="decimal" placeholder="0.00" value="${debit || ''}"></td>` +
-          `<td class="right"><input type="number" class="ie-credit" step="0.01" min="0" inputmode="decimal" placeholder="0.00" value="${credit || ''}"></td>` +
-          `<td class="right amount-cell">${fmtMoney(amount)}</td>` +
-          `<td class="center">` +
-          `<button class="action-btn edit-btn" data-tooltip="Save" aria-label="Save" onclick="saveInlineEdit(${originalIdx})"><i class="fas fa-check"></i></button>` +
-          `<button class="action-btn delete-btn" data-tooltip="Cancel" aria-label="Cancel" onclick="cancelInlineEdit()"><i class="fas fa-times"></i></button>` +
-          `</td>`;
-        tbody.appendChild(tr);
-        return;
-      }
-
-      tr.innerHTML =
-        `<td>${escapeHtml(row['Date'] || '')}</td>` +
-        `<td>${escapeHtml(row['Purchased By'] || '')}</td>` +
-        `<td>${getCategoryBadge(category)} ${escapeHtml(row['Purchased Store'] || '')}</td>` +
-        `<td>${escapeHtml(row['Bank Name'] || '')}</td>` +
-        `<td class="right debit-cell">${debit ? fmtMoney(debit) : ''}</td>` +
-        `<td class="right credit-cell">${credit ? fmtMoney(credit) : ''}</td>` +
-        `<td class="right amount-cell">${fmtMoney(amount)}</td>` +
-        `<td class="center">` +
-        `<button class="action-btn edit-btn" data-tooltip="Edit Entry" aria-label="Edit Entry" onclick="editRow(${originalIdx})"><i class="fas fa-edit"></i></button>` +
-        `<button class="action-btn delete-btn" data-tooltip="Delete Entry" aria-label="Delete Entry" onclick="removeRow(${originalIdx})"><i class="fas fa-trash"></i></button>` +
-        `</td>`;
-      tbody.appendChild(tr);
+    // Day totals follow the same rules as the dashboard (transfers don't count)
+    const dayTotals = {};
+    if (grouped) rows.forEach(r => {
+      const c = classify(r);
+      dayTotals[r['Date'] || ''] = (dayTotals[r['Date'] || ''] || 0) + c.income - c.spend;
     });
 
-    // Add summary row
-    const summaryRow = document.createElement('tr');
-    summaryRow.className = 'summary-row';
-    summaryRow.innerHTML =
-      `<td colspan="4"><strong>TOTALS</strong></td>` +
-      `<td class="right debit-cell"><strong>${fmtMoney(totalDebitC / 100)}</strong></td>` +
-      `<td class="right credit-cell"><strong>${fmtMoney(totalCreditC / 100)}</strong></td>` +
-      `<td class="right amount-cell"><strong>${fmtMoney(totalAmountC / 100)}</strong></td>` +
-      `<td class="center"></td>`;
-    tbody.appendChild(summaryRow);
+    let html = '';
+    let lastDay = null;
+    let spentC = 0;
+    let incomeC = 0;
+    let transferC = 0;
+    rows.forEach(row => {
+      const idx = indexOf.get(row);
+      const day = row['Date'] || '';
+      if (grouped && day !== lastDay) {
+        lastDay = day;
+        const total = dayTotals[day];
+        html += `<tr class="day-row"><td colspan="7"><div class="day-head"><span>${escapeHtml(dayLabel(day))}</span>` +
+          `<span class="day-total ${total > 0 ? 'is-income' : ''}">${fmtSigned(total)}</span></div></td></tr>`;
+      }
+      const c = classify(row);
+      spentC += c.spend;
+      incomeC += c.income;
+      transferC += Math.abs(c.transfer);
+      const net = toCents(row['Credit [C]']) - toCents(row['Debit [D]']);
+      const amountClass = c.kind === 'transfer' ? 'is-transfer' : net > 0 ? 'is-income' : 'is-expense';
+      const kindTag = c.kind === 'transfer' ? '<span class="kind-tag">Transfer · not counted</span>'
+        : c.kind === 'refund' ? '<span class="kind-tag refund">Refund</span>' : '';
+      const store = row['Purchased Store'] || '';
+      const meta = [grouped ? '' : shortDate(day), row['Purchased By'], row['Bank Name']].filter(Boolean).join(' · ');
+      const checked = selectedRows.has(row);
+      html +=
+        `<tr class="txn-row${checked ? ' selected' : ''}" data-index="${idx}" tabindex="0">` +
+        `<td class="sel-col"><input type="checkbox" class="row-check" data-index="${idx}"${checked ? ' checked' : ''} aria-label="Select ${escapeHtml(store || 'transaction')}"></td>` +
+        `<td class="col-date">${escapeHtml(shortDate(day))}</td>` +
+        `<td class="col-txn"><div class="txn-store">${escapeHtml(store || '—')}</div>` +
+        `<div class="txn-sub">${getCategoryBadge(getCategory(row))}${kindTag}<span class="txn-meta">${escapeHtml(meta)}</span></div></td>` +
+        `<td class="col-person">${escapeHtml(row['Purchased By'] || '')}</td>` +
+        `<td class="col-bank">${escapeHtml(row['Bank Name'] || '')}</td>` +
+        `<td class="right amount-cell ${amountClass}">${fmtSigned(net)}</td>` +
+        `<td class="center col-actions">` +
+        `<button type="button" class="icon-btn" data-action="editRow" data-index="${idx}" aria-label="Edit ${escapeHtml(store || 'transaction')}"><i class="fas fa-pen"></i></button>` +
+        `<button type="button" class="icon-btn danger" data-action="removeRow" data-index="${idx}" aria-label="Delete ${escapeHtml(store || 'transaction')}"><i class="fas fa-trash"></i></button>` +
+        `</td></tr>`;
+    });
+    tbody.innerHTML = html;
+
+    const n = filteredData.length;
+    tfoot.innerHTML = `<tr><td colspan="7"><div class="table-totals">` +
+      `<span>${n} transaction${n === 1 ? '' : 's'}</span>` +
+      `<span>Spent <strong class="is-expense">${fmtMoney(spentC / 100)}</strong></span>` +
+      `<span>Income <strong class="is-income">${fmtMoney(incomeC / 100)}</strong></span>` +
+      `<span>Net <strong class="${incomeC - spentC >= 0 ? 'is-income' : 'is-expense'}">${fmtSigned(incomeC - spentC)}</strong></span>` +
+      (transferC ? `<span class="totals-transfer">Transfers <strong>${fmtMoney(transferC / 100)}</strong> not counted</span>` : '') +
+      `</div></td></tr>`;
 
     updateTotals();
     renderBudgetTracking();
@@ -1212,110 +1465,372 @@
     section.style.display = 'block';
     list.innerHTML = '';
 
-    // Budgets are monthly: only count spending from the current month
-    const monthPrefix = todayStr().slice(0, 7);
-    const monthName = new Date().toLocaleString('default', { month: 'long', year: 'numeric' });
+    // Budgets are monthly: count the month shown in the overview (or this month for "All time")
+    const monthPrefix = dashActive !== 'all' ? dashActive : todayStr().slice(0, 7);
+    const monthName = monthLabelOf(monthPrefix, { month: 'long', year: 'numeric' });
     document.getElementById('budgetMonthLabel').textContent = `— ${monthName}`;
 
+    // For the month in progress, project month-end spending from the pace so far
+    const isCurrent = monthPrefix === todayStr().slice(0, 7);
+    const monthRows = budgetData.filter(r => (r['Date'] || '').startsWith(monthPrefix));
+    const [by, bm] = monthPrefix.split('-').map(Number);
+    const daysInMonth = new Date(by, bm, 0).getDate();
+    const elapsed = isCurrent ? monthCutoffDay(monthRows) : daysInMonth;
+
     Object.entries(settings.budgets).forEach(([target, limit]) => {
-      const spent = budgetData.reduce((cents, r) => {
-        if (!(r['Date'] || '').startsWith(monthPrefix)) return cents;
+      const spentC = monthRows.reduce((cents, r) => {
         const cat = getCategory(r);
         // A budget can target a sub-category, a whole group (e.g. "Bills & Utilities"), or store text
         const matches = (cat === target || getCategoryGroup(cat) === target ||
           (r['Purchased Store'] || '').toLowerCase().includes(target.toLowerCase()));
-        return matches ? cents + toCents(r['Debit [D]']) : cents;
-      }, 0) / 100;
-
-      const percent = Math.min((spent / limit) * 100, 100);
-      const color = percent >= 100 ? 'var(--danger-color)' : percent > 80 ? 'var(--warning-color)' : 'var(--gradient)';
+        return matches ? cents + spendOf(r) : cents;
+      }, 0);
+      const limitC = toCents(limit);
+      const projectedC = isCurrent ? forecastMonth(spentC, elapsed, daysInMonth) : null;
+      const status = budgetStatus(spentC, limitC, projectedC);
+      const percent = limitC > 0 ? Math.max(0, Math.min((spentC / limitC) * 100, 100)) : 0;
+      const left = limitC - spentC;
+      const statusText = { over: 'Over budget', risk: 'At risk', ok: 'On track' }[status];
+      const statusIcon = { over: 'fa-circle-exclamation', risk: 'fa-triangle-exclamation', ok: 'fa-circle-check' }[status];
+      const detail = left >= 0 ? `${fmtMoney(left / 100)} left` : `${fmtMoney(-left / 100)} over`;
+      const forecast = projectedC !== null && status !== 'over'
+        ? ` · on pace for ${fmtMoney(projectedC / 100)}` : '';
 
       const item = document.createElement('div');
-      item.className = 'budget-item';
+      item.className = `budget-item budget-${status}`;
       item.innerHTML = `
-        <div style="display:flex; justify-content:space-between; font-size:12px; font-weight:700;">
-          <span>${escapeHtml(target)}</span>
-          <span>${fmtMoney(spent)} / ${fmtMoney(limit)}</span>
+        <div class="budget-row">
+          <span class="budget-name">${escapeHtml(target)}</span>
+          <span class="budget-amounts">${fmtMoney(spentC / 100)} <span>/ ${fmtMoney(limitC / 100)}</span></span>
         </div>
-        <div class="progress-bar-bg"><div class="progress-bar-fill" style="width: ${percent}%; background: ${color};"></div></div>
+        <div class="progress-bar-bg"><div class="progress-bar-fill" style="width: ${percent}%"></div></div>
+        <div class="budget-foot">
+          <span class="budget-status"><i class="fas ${statusIcon}" aria-hidden="true"></i> ${statusText}</span>
+          <span>${detail}${forecast}</span>
+        </div>
       `;
       list.appendChild(item);
     });
   }
 
-  // Editing happens inline, directly on the table row
-  function editRow(index) {
-    inlineEditIndex = index;
-    renderTable();
-    const firstInput = document.querySelector('#budgetTable tbody tr.editing-row input');
-    if (firstInput) firstInput.focus();
-  }
-
-  function cancelInlineEdit() {
-    inlineEditIndex = -1;
-    renderTable();
-  }
-
-  function saveInlineEdit(index) {
-    const tr = document.querySelector('#budgetTable tbody tr.editing-row');
-    if (!tr) return;
-
-    const date = tr.querySelector('.ie-date').value;
-    const debitVal = tr.querySelector('.ie-debit').value;
-    const creditVal = tr.querySelector('.ie-credit').value;
-    const debit = debitVal === '' ? 0 : parseFloat(debitVal);
-    const credit = creditVal === '' ? 0 : parseFloat(creditVal);
-
-    if (!date || isNaN(debit) || isNaN(credit) || debit < 0 || credit < 0 || (debit === 0 && credit === 0)) {
-      showStatus('⚠️ Enter a valid date and a debit or credit amount.', true);
-      return;
-    }
-
-    const entry = {
-      'Date': date,
-      'Purchased By': tr.querySelector('.ie-payer').value,
-      'Purchased Store': tr.querySelector('.ie-store').value.trim(),
-      'Bank Name': tr.querySelector('.ie-bank').value,
-      'Debit [D]': debit || '',
-      'Credit [C]': credit || '',
-      'Amount Total': (toCents(debit) + toCents(credit)) / 100
+  // ---- Edit dialog ----
+  function openEditor(index) {
+    const row = budgetData[index];
+    if (!row) return;
+    editIndex = index;
+    const settings = getSettings();
+    // Keep the row's own value selectable even if it was removed from Settings
+    const fill = (id, list, current) => {
+      const items = (!current || list.includes(current)) ? list : [current, ...list];
+      document.getElementById(id).innerHTML = items.map(v =>
+        `<option value="${escapeHtml(v)}"${v === current ? ' selected' : ''}>${escapeHtml(v)}</option>`).join('');
     };
-    const cat = tr.querySelector('.ie-category').value;
-    if (cat) entry['Category'] = cat;
+    fill('editPerson', settings.people, row['Purchased By'] || '');
+    fill('editBank', settings.banks, row['Bank Name'] || '');
 
-    budgetData[index] = entry;
-    inlineEditIndex = -1;
+    const debit = toCents(row['Debit [D]']);
+    const credit = toCents(row['Credit [C]']);
+    const isIncome = credit > debit;
+    setEntryType(document.querySelector('#editCard .type-toggle'), isIncome ? 'C' : 'D');
+    // Old rows can carry both columns; the dialog edits the net amount
+    document.getElementById('editAmount').value = (Math.abs(credit - debit) / 100).toFixed(2);
+    document.getElementById('editDate').value = /^\d{4}-\d{2}-\d{2}$/.test(row['Date']) ? row['Date'] : '';
+    document.getElementById('editStore').value = row['Purchased Store'] || '';
+
+    const cat = row['Category'] || '';
+    const catSel = document.getElementById('editCategory');
+    if (cat && ![...catSel.options].some(o => o.value === cat)) {
+      catSel.insertAdjacentHTML('beforeend', `<option value="${escapeHtml(cat)}">${escapeHtml(cat)}</option>`);
+    }
+    catSel.value = cat;
+    document.getElementById('editCategoryLabel').textContent = cat || `Auto-detect (${categorizeStore(row['Purchased Store'] || '')})`;
+
+    setFieldError('editAmountError', '');
+    setFieldError('editDateError', '');
+    syncDateChips();
+    document.getElementById('editModal').style.display = 'flex';
+    setTimeout(() => document.getElementById('editAmount').focus(), 50);
+  }
+
+  function closeEditor() {
+    editIndex = -1;
+    closeCategoryPickers();
+    document.getElementById('editModal').style.display = 'none';
+  }
+
+  function saveEdit() {
+    if (editIndex < 0) return;
+    const entry = readEntryForm(EDIT_FORM);
+    if (!entry || !confirmIfDuplicate(entry, editIndex)) return;
+    const before = budgetData[editIndex];
+    const at = editIndex;
+    budgetData[at] = entry;
+    if (selectedRows.delete(before)) selectedRows.add(entry);
+    markChanged();
+    closeEditor();
     renderTable();
-    showStatus('✅ Entry updated.');
+    // The edited row was redrawn, so put keyboard focus back on its new copy
+    const rowEl = document.querySelector(`#budgetTable tr.txn-row[data-index="${at}"]`);
+    if (rowEl) rowEl.focus({ preventScroll: true });
+    showStatus('✅ Changes saved.', false, () => {
+      if (budgetData[at] === entry) budgetData[at] = before;
+      markChanged();
+      renderTable();
+      showStatus('↩️ Edit undone.');
+    });
+  }
+
+  function duplicateFromEditor() {
+    if (editIndex < 0) return;
+    const entry = readEntryForm(EDIT_FORM);
+    if (!entry) return;
+    entry['Date'] = todayStr();
+    budgetData.push(entry);
+    markChanged();
+    closeEditor();
+    dashPinned = null;
+    renderTable();
+    showStatus(`✅ Copied to today: ${entry['Purchased Store'] || 'transaction'} ${fmtMoney(entry['Amount Total'])}`);
   }
 
   function removeRow(index) {
-    const removed = budgetData.splice(index, 1)[0];
-    if (inlineEditIndex === index) {
-      inlineEditIndex = -1;
-    } else if (inlineEditIndex > index) {
-      inlineEditIndex--;
-    }
+    const removed = budgetData[index];
+    if (!removed) return;
+    budgetData.splice(index, 1);
+    selectedRows.delete(removed);
+    markChanged();
     renderTable();
     showStatus('🗑️ Entry deleted.', false, () => {
       budgetData.splice(Math.min(index, budgetData.length), 0, removed);
+      markChanged();
       renderTable();
       showStatus('↩️ Entry restored.');
     });
   }
 
-  function clearTable() {
-    if (confirm('🗑️ Clear all data? This action cannot be undone.')) {
-      budgetData = [];
-      inlineEditIndex = -1;
-      renderTable();
-      showStatus('✅ All data cleared!');
-    }
+  // ---- Bulk actions ----
+  function updateBulkBar(filteredData) {
+    const bar = document.getElementById('bulkBar');
+    const count = selectedRows.size;
+    bar.hidden = count === 0;
+    document.getElementById('bulkCount').textContent = `${count} selected`;
+    const all = document.getElementById('selectAll');
+    const shown = filteredData || getFilteredData();
+    const shownSelected = shown.filter(r => selectedRows.has(r)).length;
+    all.checked = shown.length > 0 && shownSelected === shown.length;
+    all.indeterminate = shownSelected > 0 && shownSelected < shown.length;
   }
 
-  function downloadExcel() {
+  function bulkSetCategory() {
+    const value = document.getElementById('bulkCategory').value;
+    if (!value) {
+      showStatus('⚠️ Choose a category first.', true);
+      return;
+    }
+    const rows = [...selectedRows];
+    const before = rows.map(r => r['Category']);
+    rows.forEach(r => {
+      if (value === '__auto') delete r['Category'];
+      else r['Category'] = value;
+    });
+    markChanged(rows.length);
+    renderTable();
+    showStatus(`🏷️ Updated ${rows.length} transaction${rows.length === 1 ? '' : 's'}.`, false, () => {
+      rows.forEach((r, i) => {
+        if (before[i] === undefined) delete r['Category'];
+        else r['Category'] = before[i];
+      });
+      markChanged();
+      renderTable();
+      showStatus('↩️ Categories restored.');
+    });
+  }
+
+  function bulkDelete() {
+    const rows = new Set(selectedRows);
+    if (!rows.size || !confirm(`Delete ${rows.size} selected transaction${rows.size === 1 ? '' : 's'}?`)) return;
+    const snapshot = budgetData;
+    budgetData = budgetData.filter(r => !rows.has(r));
+    selectedRows.clear();
+    markChanged(rows.size);
+    renderTable();
+    showStatus(`🗑️ Deleted ${rows.size} transaction${rows.size === 1 ? '' : 's'}.`, false, () => {
+      budgetData = snapshot;
+      markChanged();
+      renderTable();
+      showStatus('↩️ Transactions restored.');
+    });
+  }
+
+  // ---- Unsaved changes & draft ----
+  const DRAFT_KEY = 'spendwise_draft';
+  let pendingDraft = null; // a draft from a previous visit, waiting for Restore/Discard
+
+  function markChanged(n = 1) {
+    unsavedCount += n;
+    persistDraft();
+    updateUnsavedBadge();
+  }
+
+  function markSaved() {
+    unsavedCount = 0;
+    persistDraft();
+    updateUnsavedBadge();
+  }
+
+  // Unsaved work is kept on this device only (never sent anywhere), so a
+  // refresh or closed tab can't lose it. Cleared once the data is saved.
+  function persistDraft() {
+    try {
+      if (unsavedCount > 0 && budgetData.length) {
+        localStorage.setItem(DRAFT_KEY, JSON.stringify({
+          v: 1,
+          savedAt: Date.now(),
+          unsaved: unsavedCount,
+          rows: budgetData,
+          source: source ? { name: source.name, months: source.months } : null
+        }));
+      } else {
+        localStorage.removeItem(DRAFT_KEY);
+      }
+    } catch (e) { /* storage full or unavailable — the leave-page warning still protects */ }
+  }
+
+  function updateUnsavedBadge() {
+    const badge = document.getElementById('unsavedBadge');
+    badge.hidden = unsavedCount === 0;
+    badge.textContent = unsavedCount > 99 ? '99+' : String(unsavedCount);
+    document.getElementById('downloadBtn').setAttribute('aria-label', unsavedCount
+      ? `Save to Excel, ${unsavedCount} unsaved change${unsavedCount === 1 ? '' : 's'}`
+      : 'Save to Excel');
+  }
+
+  function checkForDraft() {
+    let draft = null;
+    try { draft = JSON.parse(localStorage.getItem(DRAFT_KEY)); } catch (e) { /* corrupted */ }
+    if (!draft || !Array.isArray(draft.rows) || !draft.rows.length) {
+      try { localStorage.removeItem(DRAFT_KEY); } catch (e) { /* ignore */ }
+      return;
+    }
+    pendingDraft = draft;
+    const when = new Date(Number(draft.savedAt) || Date.now()).toLocaleString(undefined,
+      { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+    const changes = Math.max(1, parseInt(draft.unsaved, 10) || 1);
+    document.getElementById('draftText').textContent =
+      `You have ${changes} unsaved change${changes === 1 ? '' : 's'} from ${when} (${draft.rows.length} transactions).`;
+    document.getElementById('draftBanner').hidden = false;
+  }
+
+  async function restoreDraft() {
+    const draft = pendingDraft;
+    if (!draft) return;
+    if (unsavedCount > 0 && !confirm('Replace what you have entered now with the restored transactions?')) return;
+    // Rows go through the same cleanup as an Excel file
+    budgetData = draft.rows.filter(r => r && typeof r === 'object').map(normalizeRow);
+    source = null;
+    if (draft.source && typeof draft.source.name === 'string' && Array.isArray(draft.source.months)) {
+      const handle = await loadSourceHandle();
+      source = {
+        name: draft.source.name,
+        months: draft.source.months.filter(m => /^\d{4}-\d{2}$/.test(m)),
+        handle: handle && handle.name === draft.source.name ? handle : null,
+        workbook: null
+      };
+    }
+    pendingDraft = null;
+    document.getElementById('draftBanner').hidden = true;
+    selectedRows.clear();
+    dashPinned = null;
+    unsavedCount = 0;
+    markChanged(Math.max(1, parseInt(draft.unsaved, 10) || 1));
+    renderTable();
+    showStatus(`↩️ Restored ${budgetData.length} transactions. Save when you're ready.`);
+  }
+
+  function discardDraft() {
+    pendingDraft = null;
+    document.getElementById('draftBanner').hidden = true;
+    persistDraft(); // keeps any work from this visit, drops the old draft otherwise
+    showStatus('🧹 Old unsaved changes discarded.');
+  }
+
+  // The writable file handle (Chrome/Edge) is kept in IndexedDB so Save can
+  // still update the same file after a restore
+  function idbRequest(mode, fn) {
+    return new Promise((resolve, reject) => {
+      if (!('indexedDB' in window)) { resolve(null); return; }
+      const open = indexedDB.open('moneta', 1);
+      open.onupgradeneeded = () => open.result.createObjectStore('kv');
+      open.onerror = () => reject(open.error);
+      open.onsuccess = () => {
+        const tx = open.result.transaction('kv', mode);
+        const req = fn(tx.objectStore('kv'));
+        tx.oncomplete = () => { open.result.close(); resolve(req ? req.result : null); };
+        tx.onerror = () => reject(tx.error);
+      };
+    });
+  }
+
+  function storeSourceHandle(handle) {
+    return idbRequest('readwrite', store => (handle ? store.put(handle, 'source') : store.delete('source'))).catch(() => null);
+  }
+
+  function loadSourceHandle() {
+    return idbRequest('readonly', store => store.get('source')).catch(() => null);
+  }
+
+  function clearTable() {
+    if (!budgetData.length) {
+      showStatus('ℹ️ There are no transactions to clear.');
+      return;
+    }
+    const warn = unsavedCount ? `\n\n⚠️ ${unsavedCount} change${unsavedCount === 1 ? ' is' : 's are'} not saved to Excel yet.` : '';
+    if (!confirm(`🗑️ Clear all ${budgetData.length} transactions from the screen?${warn}`)) return;
+    const snapshot = { rows: budgetData, unsaved: unsavedCount, source };
+    budgetData = [];
+    selectedRows.clear();
+    source = null;
+    storeSourceHandle(null);
+    markSaved();
+    renderTable();
+    showStatus('✅ All data cleared.', false, () => {
+      budgetData = snapshot.rows;
+      source = snapshot.source;
+      if (source && source.handle) storeSourceHandle(source.handle);
+      unsavedCount = 0;
+      markChanged(snapshot.unsaved || 0);
+      renderTable();
+      showStatus('↩️ Transactions restored.');
+    });
+  }
+
+  // ---- Saving to Excel ----
+  const EXPORT_COLUMNS = ['Date', 'Purchased By', 'Purchased Store', 'Bank Name', 'Category', 'Debit [D]', 'Credit [C]', 'Amount Total'];
+
+  function buildSheet(rows) {
+    const clean = rows.map(r => Object.fromEntries(EXPORT_COLUMNS.map(c => [c, r[c] ?? ''])));
+    const ws = XLSX.utils.json_to_sheet(clean, { header: EXPORT_COLUMNS });
+    const widths = EXPORT_COLUMNS.map(col => Math.max(col.length, ...clean.map(row => String(row[col]).length)));
+    ws['!cols'] = widths.map(w => ({ wch: Math.min(40, Math.max(10, w + 2)) }));
+    return ws;
+  }
+
+  // Puts the sheet first in the workbook, keeping any other sheets the user added
+  function withDataSheet(workbook, ws) {
+    const wb = workbook || XLSX.utils.book_new();
+    if (wb.SheetNames.length) wb.Sheets[wb.SheetNames[0]] = ws;
+    else XLSX.utils.book_append_sheet(wb, ws, 'Budget Data');
+    return wb;
+  }
+
+  function monthFileName(key) {
+    if (!/^\d{4}-\d{2}$/.test(key)) return 'Expenses.xlsx';
+    return `${monthLabelOf(key, { month: 'short' })}-${key.slice(0, 4)}-Expenses.xlsx`;
+  }
+
+  async function downloadExcel() {
     if (budgetData.length === 0) {
-      showStatus('❌ No data to download!', true);
+      showStatus('❌ No data to save yet.', true);
       return;
     }
     if (typeof XLSX === 'undefined') {
@@ -1323,22 +1838,75 @@
       return;
     }
     try {
-      const cols = ['Date','Purchased By','Purchased Store','Bank Name','Category','Debit [D]','Credit [C]','Amount Total'];
-      const ws = XLSX.utils.json_to_sheet(budgetData, { header: cols });
-      const maxWidths = cols.map(col => Math.max(col.length, ...budgetData.map(row => String(row[col] || '').length)));
-      ws['!cols'] = maxWidths.map(width => ({ wch: Math.min(40, Math.max(10, width + 2)) }));
-      const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, 'Budget Data');
-      const now = new Date();
-      const month = now.toLocaleString('default', { month: 'short' });
-      const year = now.getFullYear();
-      const date = String(now.getDate()).padStart(2, '0');
-      const fileName = `${month}-${year}-${date}-Expenses.xlsx`;
-      XLSX.writeFile(wb, fileName);
-      showStatus('✅ Excel file downloaded successfully!');
+      const groups = groupForSave(budgetData, source ? source.months : null, todayStr().slice(0, 7));
+      const done = [];
+      for (const [key, rows] of groups) {
+        const ws = buildSheet(rows);
+        if (key === 'source') {
+          if (source.handle && await saveToSourceFile(ws)) {
+            done.push(`updated ${source.name}`);
+            continue;
+          }
+          const name = source.name.replace(/\.[^.]*$/, '') + '.xlsx';
+          XLSX.writeFile(withDataSheet(source.workbook, ws), name);
+          done.push(`downloaded ${name}`);
+        } else {
+          const name = monthFileName(key);
+          XLSX.writeFile(withDataSheet(null, ws), name);
+          done.push(`downloaded ${name}`);
+        }
+      }
+      markSaved();
+      showStatus(`✅ Saved — ${done.join(', ')}`);
     } catch (error) {
-      showStatus('❌ Error downloading Excel file: ' + error.message, true);
+      showStatus('❌ Could not save the Excel file: ' + error.message, true);
     }
+  }
+
+  // Writes into the file that was opened (Chrome/Edge). Returns false if the
+  // user declines access, so the caller falls back to a download.
+  async function saveToSourceFile(ws) {
+    const { handle } = source;
+    const opts = { mode: 'readwrite' };
+    if ((await handle.queryPermission(opts)) !== 'granted' &&
+        (await handle.requestPermission(opts)) !== 'granted') {
+      return false;
+    }
+    if (!source.workbook) {
+      // After a restore: re-read the file so its other sheets are kept
+      source.workbook = XLSX.read(new Uint8Array(await (await handle.getFile()).arrayBuffer()), { type: 'array' });
+    }
+    const writable = await handle.createWritable();
+    await writable.write(XLSX.write(withDataSheet(source.workbook, ws), { bookType: 'xlsx', type: 'array' }));
+    await writable.close();
+    return true;
+  }
+
+  async function pickAndLinkExcel() {
+    if (!confirmReplaceUnsaved()) return;
+    let handle;
+    try {
+      [handle] = await window.showOpenFilePicker({
+        types: [{
+          description: 'Excel files',
+          accept: {
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'],
+            'application/vnd.ms-excel': ['.xls']
+          }
+        }]
+      });
+    } catch (e) {
+      return; // picker cancelled
+    }
+    // Only .xlsx can be written back; .xls files are saved as a new .xlsx
+    const writable = /\.xlsx$/i.test(handle.name);
+    const ok = await importWorkbook(await handle.getFile(), writable ? handle : null);
+    if (ok) storeSourceHandle(writable ? handle : null);
+  }
+
+  function confirmReplaceUnsaved() {
+    return unsavedCount === 0 ||
+      confirm(`You have ${unsavedCount} unsaved change${unsavedCount === 1 ? '' : 's'}. Open another file and lose them?`);
   }
 
   // Converts any date Excel might hand us (ISO string, Date cell, serial
@@ -1388,32 +1956,54 @@
 
   function uploadExcel(event) {
     const file = event.target.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = function(e) {
-      try {
-        const data = new Uint8Array(e.target.result);
-        const workbook = XLSX.read(data, { type: 'array' });
-        const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-        const jsonData = XLSX.utils.sheet_to_json(firstSheet);
-        if (jsonData.length === 0) {
-          showStatus('❌ No data found in the Excel file.', true);
-          return;
-        }
-        budgetData = jsonData.map(normalizeRow);
-        renderTable();
-        showStatus(`✅ Imported ${budgetData.length} transaction${budgetData.length > 1 ? 's' : ''} from Excel.`);
-      } catch (error) {
-        showStatus('❌ Error reading Excel file: ' + error.message, true);
-      }
-    };
-    reader.readAsArrayBuffer(file);
     event.target.value = '';
+    if (!file || !confirmReplaceUnsaved()) return;
+    importWorkbook(file, null).then(ok => { if (ok) storeSourceHandle(null); });
+  }
+
+  // Loads the first sheet into the table and remembers the file as the save
+  // target for its months. Resolves to true on success.
+  async function importWorkbook(file, handle) {
+    try {
+      if (typeof XLSX === 'undefined') throw new Error('Excel library not loaded. Please refresh.');
+      if (file.size > 20 * 1024 * 1024) throw new Error('File is larger than 20 MB.');
+      const data = new Uint8Array(await file.arrayBuffer());
+      const workbook = XLSX.read(data, { type: 'array' });
+      const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+      const jsonData = firstSheet ? XLSX.utils.sheet_to_json(firstSheet) : [];
+      if (jsonData.length === 0) {
+        showStatus('❌ No data found in the Excel file.', true);
+        return false;
+      }
+      budgetData = jsonData.map(normalizeRow);
+      source = {
+        name: file.name,
+        months: [...new Set(budgetData.map(monthKeyOf).filter(Boolean))],
+        handle,
+        workbook
+      };
+      selectedRows.clear();
+      editIndex = -1;
+      dashPinned = null;
+      pendingDraft = null;
+      document.getElementById('draftBanner').hidden = true;
+      markSaved();
+      renderTable();
+      const dups = countDuplicates(budgetData);
+      showStatus(`✅ Opened ${budgetData.length} transaction${budgetData.length > 1 ? 's' : ''} from ${file.name}` +
+        (dups ? ` · ⚠️ ${dups} look${dups === 1 ? 's' : ''} like duplicate${dups === 1 ? '' : 's'}` : ''));
+      return true;
+    } catch (error) {
+      showStatus('❌ Error reading Excel file: ' + error.message, true);
+      return false;
+    }
   }
 
   async function uploadMultipleExcel(event) {
-    const files = event.target.files;
-    if (!files || files.length === 0) return;
+    // Copy first: clearing the input (so the same files can be picked again) empties its FileList
+    const files = [...(event.target.files || [])];
+    event.target.value = '';
+    if (files.length === 0) return;
 
     const allMonthlyData = {};
     let grandTotalIncome = 0;
@@ -1441,8 +2031,9 @@
                     const label = displayDate.toLocaleString('default', { month: 'short', year: 'numeric' });
                     allMonthlyData[sortKey] = { label, income: 0, expenses: 0 };
                   }
-                  allMonthlyData[sortKey].income += toCents(row['Credit [C]']);
-                  allMonthlyData[sortKey].expenses += toCents(row['Debit [D]']);
+                  const c = classify(row);
+                  allMonthlyData[sortKey].income += c.income;
+                  allMonthlyData[sortKey].expenses += c.spend;
                 }
               }
             });
@@ -1467,7 +2058,7 @@
       document.getElementById('compareTotalIncome').textContent = fmtMoney(grandTotalIncome / 100);
       document.getElementById('compareTotalExpense').textContent = fmtMoney(grandTotalExpense / 100);
       document.getElementById('compareTotalSavings').textContent = fmtMoney((grandTotalIncome - grandTotalExpense) / 100);
-      document.getElementById('comparisonSummary').style.display = 'flex';
+      document.getElementById('comparisonSummary').style.display = 'grid';
 
       updateCompareMonthsChart(allMonthlyData);
       showStatus(`✅ Successfully processed ${files.length} files for comparison.`);
@@ -1531,17 +2122,440 @@
   }
 
   function updateTotals() {
-    const totalDebitC = sumCents(budgetData, 'Debit [D]');
-    const totalCreditC = sumCents(budgetData, 'Credit [C]');
-    const net = (totalCreditC - totalDebitC) / 100;
-
-    document.getElementById('totalDebit').textContent = fmtMoney(totalDebitC / 100);
-    document.getElementById('totalCredit').textContent = fmtMoney(totalCreditC / 100);
-    const netEl = document.getElementById('netTotal');
-    netEl.textContent = fmtMoney(net);
-    netEl.classList.toggle('pos', net >= 0);
-    netEl.classList.toggle('neg', net < 0);
+    renderDashboard();
   }
+
+  // ---- Pure calculation helpers (covered by tests.js) ----
+  function monthKeyOf(row) {
+    const k = String(row['Date'] || '').slice(0, 7);
+    return /^\d{4}-\d{2}$/.test(k) ? k : null;
+  }
+
+  function monthLabelOf(key, opts = { month: 'short', year: 'numeric' }) {
+    const [y, m] = key.split('-').map(Number);
+    return new Date(y, m - 1, 1).toLocaleString('default', opts);
+  }
+
+  function shiftMonth(key, n) {
+    const [y, m] = key.split('-').map(Number);
+    const d = new Date(y, m - 1 + n, 1);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+  }
+
+  function dayOf(row) {
+    return Number(String(row['Date'] || '').slice(8, 10)) || 0;
+  }
+
+  // What a row means for your totals, in cents:
+  //  - Transfers & Savings (card payments, own-account moves, investing) count as neither
+  //  - Income-category credits are income
+  //  - everything else is spending; a credit there is a refund and lowers spending
+  function classify(row) {
+    const debit = toCents(row['Debit [D]']);
+    const credit = toCents(row['Credit [C]']);
+    const group = getCategoryGroup(getCategory(row));
+    if (group === TRANSFER_GROUP) return { spend: 0, income: 0, transfer: credit - debit, kind: 'transfer' };
+    if (group === 'Income') return { spend: 0, income: credit - debit, transfer: 0, kind: 'income' };
+    return { spend: debit - credit, income: 0, transfer: 0, kind: credit > debit ? 'refund' : 'expense' };
+  }
+
+  const spendOf = row => classify(row).spend;
+  const incomeOf = row => classify(row).income;
+
+  function periodTotals(rows) {
+    let spentC = 0;
+    let incomeC = 0;
+    rows.forEach(r => {
+      const c = classify(r);
+      spentC += c.spend;
+      incomeC += c.income;
+    });
+    return {
+      spent: spentC / 100,
+      income: incomeC / 100,
+      net: (incomeC - spentC) / 100,
+      rate: incomeC > 0 ? ((incomeC - spentC) / incomeC) * 100 : null
+    };
+  }
+
+  // Same date, store and amounts = probably the same transaction
+  function dupKey(r) {
+    return [r['Date'] || '', String(r['Purchased Store'] || '').trim().toLowerCase(),
+      toCents(r['Debit [D]']), toCents(r['Credit [C]'])].join('|');
+  }
+
+  function findDuplicate(rows, entry, skipIndex = -1) {
+    const key = dupKey(entry);
+    return rows.findIndex((r, i) => i !== skipIndex && dupKey(r) === key);
+  }
+
+  function countDuplicates(rows) {
+    const seen = new Set();
+    let dups = 0;
+    rows.forEach(r => {
+      const k = dupKey(r);
+      if (seen.has(k)) dups++;
+      else seen.add(k);
+    });
+    return dups;
+  }
+
+  // Decides which file each row is saved to. Months that came from the opened
+  // file go back to it ('source'); any other month gets its own YYYY-MM file.
+  // Rows without a valid date stay with the opened file, or else the newest month.
+  function groupForSave(rows, sourceMonths, currentMonth) {
+    const own = new Set(sourceMonths || []);
+    const months = rows.map(monthKeyOf).filter(Boolean).sort();
+    const fallback = sourceMonths ? 'source' : (months[months.length - 1] || currentMonth);
+    const groups = new Map();
+    rows.forEach(r => {
+      const m = monthKeyOf(r);
+      const key = m ? (own.has(m) ? 'source' : m) : fallback;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(r);
+    });
+    return groups;
+  }
+  // Straight-line month-end projection from spending so far
+  function forecastMonth(spentC, elapsedDays, daysInMonth) {
+    if (!(elapsedDays > 0)) return spentC;
+    return Math.round((spentC / Math.min(elapsedDays, daysInMonth)) * daysInMonth);
+  }
+
+  function budgetStatus(spentC, limitC, projectedC) {
+    if (spentC > limitC) return 'over';
+    if (projectedC !== null && projectedC > limitC) return 'risk';
+    return 'ok';
+  }
+  // ---- end pure helpers ----
+
+  // ---- Overview dashboard ----
+  // Built from budgetData only (never the table filters), so it always shows
+  // the whole file. Old exports work too: every row went through normalizeRow.
+  let dashCategoryChart = null;
+  let dashPaceChart = null;
+  let dashTrendChart = null;
+  let dashPinned = null;     // month the user picked; null = follow the latest
+  let dashActive = 'all';    // what's on screen: 'YYYY-MM' or 'all'
+
+  // Last day to show for the current month: today, or later if entries are dated ahead
+  function monthCutoffDay(rows) {
+    return rows.reduce((max, r) => Math.max(max, dayOf(r)), new Date().getDate());
+  }
+
+  function dataMonths() {
+    return [...new Set(budgetData.map(monthKeyOf).filter(Boolean))].sort().reverse(); // newest first
+  }
+
+  function renderDashboard() {
+    const months = dataMonths();
+    dashActive = (dashPinned === 'all' || months.includes(dashPinned)) ? dashPinned : (months[0] || 'all');
+
+    const sel = document.getElementById('dashPeriod');
+    sel.innerHTML = '<option value="all">All time</option>' +
+      months.map(k => `<option value="${k}">${escapeHtml(monthLabelOf(k, { month: 'long', year: 'numeric' }))}</option>`).join('');
+    sel.value = dashActive;
+    const idx = months.indexOf(dashActive);
+    document.getElementById('dashPrev').disabled = dashActive === 'all' || idx === months.length - 1;
+    document.getElementById('dashNext').disabled = dashActive === 'all' || idx <= 0;
+
+    const isMonth = dashActive !== 'all';
+    const rows = isMonth ? budgetData.filter(r => monthKeyOf(r) === dashActive) : budgetData;
+    const prevKey = isMonth ? shiftMonth(dashActive, -1) : null;
+    const prevRows = prevKey ? budgetData.filter(r => monthKeyOf(r) === prevKey) : [];
+    // A month still in progress is compared with the same days of last month,
+    // so day 10 isn't measured against a full 30 days
+    const cutoff = isMonth && dashActive === todayStr().slice(0, 7) ? monthCutoffDay(rows) : null;
+    const prevCompare = cutoff ? prevRows.filter(r => dayOf(r) <= cutoff) : prevRows;
+    const prevLabel = prevKey ? monthLabelOf(prevKey, { month: 'short' }) + (cutoff ? ` 1–${cutoff}` : '') : '';
+    renderKpis(rows, prevRows.length ? prevCompare : null, prevLabel);
+
+    const empty = budgetData.length === 0;
+    document.getElementById('dashEmpty').hidden = !empty;
+    document.getElementById('dashCharts').hidden = empty;
+    if (empty) return;
+
+    // Redrawn on every table render, so skip animation to avoid flicker
+    const theme = chartTheme();
+    renderCategoryPanel(rows, theme);
+    renderPacePanel(rows, prevRows, prevKey, theme);
+    renderTrendPanel(months, theme);
+    renderTopStores(rows);
+  }
+
+  function renderKpis(rows, prevRows, prevLabel) {
+    const cur = periodTotals(rows);
+    const prev = prevRows ? periodTotals(prevRows) : null;
+
+    document.getElementById('kpiSpent').textContent = fmtMoney(cur.spent);
+    document.getElementById('kpiIncome').textContent = fmtMoney(cur.income);
+    const netEl = document.getElementById('kpiNet');
+    netEl.textContent = fmtMoney(cur.net);
+    netEl.classList.toggle('pos', cur.net > 0);
+    netEl.classList.toggle('neg', cur.net < 0);
+    document.getElementById('kpiRate').textContent = cur.rate === null ? '—' : `${cur.rate.toFixed(0)}%`;
+
+    setDelta('kpiSpentDelta', cur.spent, prev && prev.spent, prevLabel, 'pct', false);
+    setDelta('kpiIncomeDelta', cur.income, prev && prev.income, prevLabel, 'pct', true);
+    setDelta('kpiNetDelta', cur.net, prev && prev.net, prevLabel, 'money', true);
+    setDelta('kpiRateDelta', cur.rate, prev && prev.rate, prevLabel, 'pts', true);
+  }
+
+  // Change vs last month, with an arrow + word so it never relies on color alone
+  function setDelta(id, cur, prev, prevLabel, kind, goodWhenUp) {
+    const el = document.getElementById(id);
+    el.className = 'kpi-delta';
+    if (cur === null || prev === null || prev === undefined || (kind === 'pct' && prev === 0)) {
+      el.textContent = '';
+      return;
+    }
+    const diff = cur - prev;
+    if (Math.abs(diff) < 0.005) {
+      el.textContent = `Same as ${prevLabel}`;
+      return;
+    }
+    const text = kind === 'pct' ? `${Math.abs((diff / prev) * 100).toFixed(0)}%`
+      : kind === 'pts' ? `${Math.abs(diff).toFixed(0)} pts`
+      : fmtMoney(Math.abs(diff));
+    const up = diff > 0;
+    el.classList.add(up === goodWhenUp ? 'good' : 'bad');
+    el.innerHTML = `<i class="fas fa-arrow-${up ? 'up' : 'down'}" aria-hidden="true"></i> ${up ? 'Up' : 'Down'} ${escapeHtml(text)} vs ${escapeHtml(prevLabel)}`;
+  }
+
+  function renderCategoryPanel(rows, theme) {
+    const totals = {};
+    rows.forEach(r => {
+      const c = spendOf(r); // refunds come off their category
+      if (!c) return;
+      const cat = getCategory(r);
+      totals[cat] = (totals[cat] || 0) + c;
+    });
+    const entries = Object.entries(totals).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]);
+    const top = entries.slice(0, 7);
+    const rest = entries.slice(7);
+    if (rest.length) top.push([`Other (${rest.length} more)`, rest.reduce((s, [, v]) => s + v, 0)]);
+    const totalC = entries.reduce((s, [, v]) => s + v, 0);
+
+    document.getElementById('dashCategorySub').textContent = entries.length
+      ? `${fmtMoney(totalC / 100)} across ${entries.length} categor${entries.length === 1 ? 'y' : 'ies'}`
+      : 'No spending in this period';
+
+    if (dashCategoryChart) dashCategoryChart.destroy();
+    dashCategoryChart = new Chart(document.getElementById('dashCategoryChart'), {
+      type: 'bar',
+      plugins: [barValuePlugin],
+      data: {
+        labels: top.map(([k]) => k),
+        datasets: [{
+          label: 'Spent',
+          data: top.map(([, v]) => v / 100),
+          backgroundColor: top.map(([, ], i) => (rest.length && i === top.length - 1) ? theme.other : theme.palette[i]),
+          borderRadius: 4,
+          maxBarThickness: 18
+        }]
+      },
+      options: {
+        indexAxis: 'y',
+        animation: false,
+        responsive: true,
+        maintainAspectRatio: false,
+        layout: { padding: { right: 56 } },
+        plugins: {
+          legend: chartLegend(theme, false),
+          tooltip: chartTooltip(theme, { label: shareLabel }),
+          barValues: { display: true, color: theme.ink, fontFamily: theme.fontFamily }
+        },
+        scales: {
+          x: { display: false, beginAtZero: true },
+          y: labelAxis(theme)
+        }
+      }
+    });
+  }
+
+  // Running total of spending by day of month, against the month before
+  function renderPacePanel(rows, prevRows, prevKey, theme) {
+    const wrap = document.getElementById('dashPaceWrap');
+    const sub = document.getElementById('dashPaceSub');
+    if (dashPaceChart) { dashPaceChart.destroy(); dashPaceChart = null; }
+    if (dashActive === 'all') {
+      wrap.hidden = true;
+      sub.textContent = 'Pick a month above to see how fast you are spending.';
+      return;
+    }
+    wrap.hidden = false;
+
+    const daysIn = key => { const [y, m] = key.split('-').map(Number); return new Date(y, m, 0).getDate(); };
+    const cumulative = (list, key, upTo) => {
+      const perDay = new Array(daysIn(key)).fill(0);
+      list.forEach(r => {
+        const d = dayOf(r);
+        if (d >= 1 && d <= perDay.length) perDay[d - 1] += spendOf(r);
+      });
+      let run = 0;
+      return perDay.slice(0, upTo).map(c => (run += c) / 100);
+    };
+
+    const isCurrent = dashActive === todayStr().slice(0, 7);
+    const shownDays = isCurrent ? monthCutoffDay(rows) : daysIn(dashActive);
+    const curSeries = cumulative(rows, dashActive, shownDays);
+    const prevSeries = prevRows.length ? cumulative(prevRows, prevKey, daysIn(prevKey)) : null;
+    const labelCount = Math.max(daysIn(dashActive), prevSeries ? prevSeries.length : 0);
+    const curName = monthLabelOf(dashActive, { month: 'short' });
+    const prevName = monthLabelOf(prevKey, { month: 'short' });
+
+    const spentSoFar = curSeries[curSeries.length - 1] || 0;
+    const projection = isCurrent && shownDays < daysIn(dashActive)
+      ? ` · on pace for ${fmtMoney(forecastMonth(Math.round(spentSoFar * 100), shownDays, daysIn(dashActive)) / 100)}` : '';
+    if (prevSeries) {
+      const prevAtSameDay = prevSeries[Math.min(shownDays, prevSeries.length) - 1] || 0;
+      const diff = spentSoFar - prevAtSameDay;
+      sub.textContent = `By day ${shownDays}: ${fmtMoney(spentSoFar)} vs ${fmtMoney(prevAtSameDay)} in ${prevName}` +
+        (Math.abs(diff) >= 0.01 ? ` (${diff > 0 ? fmtMoney(diff) + ' more' : fmtMoney(-diff) + ' less'})` : '') + projection;
+    } else {
+      sub.textContent = `${fmtMoney(spentSoFar)} spent${isCurrent ? ' so far' : ''}${projection || ` · no ${prevName} data to compare`}`;
+    }
+
+    const line = (label, data, color, dashed) => ({
+      label, data,
+      borderColor: color,
+      backgroundColor: color,
+      borderWidth: 2,
+      borderDash: dashed ? [6, 4] : [],
+      tension: 0.25,
+      // Mark where the current month's line ends ("today")
+      pointRadius: dashed ? 0 : c => (c.dataIndex === data.length - 1 ? 4 : 0),
+      pointHoverRadius: 5,
+      pointHoverBorderColor: theme.surface,
+      pointHoverBorderWidth: 2
+    });
+    const datasets = [line(curName, curSeries, theme.palette[0], false)];
+    if (prevSeries) datasets.push(line(prevName, prevSeries, theme.other, true));
+
+    dashPaceChart = new Chart(document.getElementById('dashPaceChart'), {
+      type: 'line',
+      data: { labels: Array.from({ length: labelCount }, (_, i) => i + 1), datasets },
+      options: {
+        animation: false,
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: chartLegend(theme, datasets.length > 1),
+          tooltip: chartTooltip(theme, {
+            title: items => `Day ${items[0].label}`,
+            label: c => `${c.dataset.label}: ${fmtMoney(c.raw)}`
+          })
+        },
+        scales: {
+          x: { ...labelAxis(theme), ticks: { ...labelAxis(theme).ticks, maxTicksLimit: 8, maxRotation: 0 } },
+          y: moneyAxis(theme)
+        }
+      }
+    });
+  }
+
+  // Up to 6 months ending at the selected month (or the latest one)
+  function renderTrendPanel(months, theme) {
+    if (dashTrendChart) dashTrendChart.destroy();
+    const end = dashActive === 'all' ? months[0] : dashActive;
+    const keys = end ? Array.from({ length: 6 }, (_, i) => shiftMonth(end, i - 5)) : [];
+    const first = keys.findIndex(k => k >= months[months.length - 1]); // trim months before the data starts
+    const shown = first > 0 ? keys.slice(first) : keys;
+    const sums = Object.fromEntries(shown.map(k => [k, { incomeC: 0, expensesC: 0 }]));
+    budgetData.forEach(r => {
+      const k = monthKeyOf(r);
+      if (sums[k]) {
+        const c = classify(r);
+        sums[k].incomeC += c.income;
+        sums[k].expensesC += c.spend;
+      }
+    });
+    document.getElementById('dashTrendSub').textContent = shown.length > 1
+      ? `${monthLabelOf(shown[0])} — ${monthLabelOf(shown[shown.length - 1])}`
+      : (shown[0] ? monthLabelOf(shown[0]) : 'No dated transactions');
+
+    const bar = (label, data, color) => ({
+      label, data, backgroundColor: color, borderRadius: 4,
+      maxBarThickness: 22, barPercentage: 0.9, categoryPercentage: 0.6
+    });
+    dashTrendChart = new Chart(document.getElementById('dashTrendChart'), {
+      type: 'bar',
+      data: {
+        labels: shown.map(k => monthLabelOf(k, { month: 'short' })),
+        datasets: [
+          bar('Income', shown.map(k => sums[k].incomeC / 100), theme.income),
+          bar('Expenses', shown.map(k => sums[k].expensesC / 100), theme.expense)
+        ]
+      },
+      options: {
+        animation: false,
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: chartLegend(theme),
+          tooltip: chartTooltip(theme, {
+            title: items => monthLabelOf(shown[items[0].dataIndex], { month: 'long', year: 'numeric' }),
+            label: c => `${c.dataset.label}: ${fmtMoney(c.raw)}`,
+            footer: items => {
+              const k = shown[items[0].dataIndex];
+              return `Net: ${fmtMoney((sums[k].incomeC - sums[k].expensesC) / 100)}`;
+            }
+          })
+        },
+        scales: { x: labelAxis(theme), y: moneyAxis(theme) }
+      }
+    });
+  }
+
+  function renderTopStores(rows) {
+    const stores = {};
+    rows.forEach(r => {
+      const c = spendOf(r);
+      const name = String(r['Purchased Store'] || '').trim();
+      if (!c || !name) return;
+      const key = name.toLowerCase();
+      if (!stores[key]) stores[key] = { name, cents: 0, count: 0 };
+      stores[key].cents += c;
+      stores[key].count++;
+    });
+    const top = Object.values(stores).filter(s => s.cents > 0).sort((a, b) => b.cents - a.cents).slice(0, 5);
+    const list = document.getElementById('dashTopStores');
+    if (!top.length) {
+      list.innerHTML = '<li class="top-empty">No spending in this period</li>';
+      return;
+    }
+    const max = top[0].cents;
+    list.innerHTML = top.map(s => `
+      <li>
+        <div class="top-row">
+          <span class="top-name">${escapeHtml(s.name)}</span>
+          <span class="top-amount">${fmtMoney(s.cents / 100)}</span>
+        </div>
+        <div class="top-meta">${s.count} purchase${s.count > 1 ? 's' : ''}</div>
+        <div class="top-bar"><span style="width: ${Math.max(2, (s.cents / max) * 100)}%"></span></div>
+      </li>`).join('');
+  }
+
+  const dashPeriodSelect = document.getElementById('dashPeriod');
+  function setDashPeriod(value) {
+    dashPinned = value;
+    renderDashboard();
+    renderBudgetTracking();
+  }
+  dashPeriodSelect.addEventListener('change', () => setDashPeriod(dashPeriodSelect.value));
+  // Prev = older month, Next = newer (the list is newest first)
+  document.getElementById('dashPrev').addEventListener('click', () => {
+    const months = dataMonths();
+    const i = months.indexOf(dashActive);
+    if (i > -1 && i < months.length - 1) setDashPeriod(months[i + 1]);
+  });
+  document.getElementById('dashNext').addEventListener('click', () => {
+    const months = dataMonths();
+    const i = months.indexOf(dashActive);
+    if (i > 0) setDashPeriod(months[i - 1]);
+  });
 
   function updateIncomeExpenseChart() {
     const ctx = document.getElementById('incomeExpenseChart').getContext('2d');
@@ -1551,8 +2565,7 @@
     }
     
     const data = getFilteredData();
-    const totalDebit = sumCents(data, 'Debit [D]') / 100;
-    const totalCredit = sumCents(data, 'Credit [C]') / 100;
+    const { spent: totalDebit, income: totalCredit } = periodTotals(data);
     const theme = chartTheme();
 
     incomeExpenseChart = new Chart(ctx, {
@@ -1599,15 +2612,16 @@
     
     const categoriesC = {};
     getFilteredData().forEach(row => {
-      if (row['Debit [D]']) {
+      const c = spendOf(row);
+      if (c) {
         const category = getCategory(row);
-        categoriesC[category] = (categoriesC[category] || 0) + toCents(row['Debit [D]']);
+        categoriesC[category] = (categoriesC[category] || 0) + c;
       }
     });
 
     // Show the top slices only and group the tail so the doughnut stays
     // readable — 7 + "Other" keeps every hue inside the validated palette
-    const catEntries = Object.entries(categoriesC).sort((a, b) => b[1] - a[1]);
+    const catEntries = Object.entries(categoriesC).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]);
     const topSlices = catEntries.slice(0, 7);
     const restSlices = catEntries.slice(7);
     if (restSlices.length) {
@@ -1672,8 +2686,9 @@
           monthlyData[sortKey] = { label: monthLabel(parts[0], parts[1]), incomeC: 0, expensesC: 0 };
         }
 
-        monthlyData[sortKey].incomeC += toCents(row['Credit [C]']);
-        monthlyData[sortKey].expensesC += toCents(row['Debit [D]']);
+        const c = classify(row);
+        monthlyData[sortKey].incomeC += c.income;
+        monthlyData[sortKey].expensesC += c.spend;
       }
     });
 
@@ -1771,14 +2786,15 @@
     
     const bankData = {};
     getFilteredData().forEach(row => {
-      if (row['Debit [D]'] && row['Bank Name']) {
-        const bank = row['Bank Name'] || 'Unknown';
-        bankData[bank] = (bankData[bank] || 0) + toCents(row['Debit [D]']);
+      const c = spendOf(row);
+      if (c && row['Bank Name']) {
+        const bank = row['Bank Name'];
+        bankData[bank] = (bankData[bank] || 0) + c;
       }
     });
 
     const sortedBanks = Object.fromEntries(
-      Object.entries(bankData).sort((a, b) => b[1] - a[1]).map(([k, v]) => [k, v / 100]));
+      Object.entries(bankData).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]).map(([k, v]) => [k, v / 100]));
     
     const theme = chartTheme();
 
@@ -1825,14 +2841,15 @@
     
     const personData = {};
     getFilteredData().forEach(row => {
-      if (row['Debit [D]'] && row['Purchased By']) {
+      const c = spendOf(row);
+      if (c && row['Purchased By']) {
         const person = row['Purchased By'] || 'Unknown';
-        personData[person] = (personData[person] || 0) + toCents(row['Debit [D]']);
+        personData[person] = (personData[person] || 0) + c;
       }
     });
 
     const sortedPersons = Object.fromEntries(
-      Object.entries(personData).sort((a, b) => b[1] - a[1]).map(([k, v]) => [k, v / 100]));
+      Object.entries(personData).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]).map(([k, v]) => [k, v / 100]));
     
     const theme = chartTheme();
 
@@ -1878,9 +2895,9 @@
   updateDropdowns();
   populateCategoryDropdown();
 
-  // Transactions are never cached: every visit starts with a blank sheet —
-  // upload an Excel file or enter new data. Recurring transactions are only
-  // applied when the user presses the Apply Recurring button.
+  // Every visit starts with a blank sheet. Only unsaved work is kept (as a
+  // draft on this device) and it is offered back, never loaded on its own.
+  // Recurring transactions are only applied with the Recurring button.
   // Older versions persisted transactions under this key; remove any leftovers
   // so devices that ran the old app don't keep stale data around.
   try { localStorage.removeItem('spendwise_data'); } catch (e) { /* storage unavailable */ }
@@ -2018,20 +3035,10 @@
     });
   });
 
-  // Enter saves while editing a row inline (but not while typing in the category search)
-  document.querySelector('#budgetTable tbody').addEventListener('keydown', (e) => {
-    if (inlineEditIndex < 0) return;
-    if (e.key === 'Enter' && !e.target.closest('.category-picker-panel')) {
-      e.preventDefault();
-      saveInlineEdit(inlineEditIndex);
-    }
-  });
-
   // Clicking the app name starts a brand-new session: clears the form,
   // filters, and all transactions (confirmed, and undoable for a few seconds).
   const appTitle = document.querySelector('h1');
   appTitle.style.cursor = 'pointer';
-  appTitle.title = 'Start fresh';
   appTitle.addEventListener('click', () => {
     resetForm();
     closeCategoryPickers();
@@ -2042,13 +3049,17 @@
       return;
     }
 
-    if (!confirm('Start fresh? This clears the form and ALL transactions below so you can begin new data entry.\n\nTip: download an Excel backup first if you need this data.')) {
+    const warn = unsavedCount ? `\n\n⚠️ ${unsavedCount} change${unsavedCount === 1 ? ' is' : 's are'} not saved to Excel yet.` : '';
+    if (!confirm(`Start fresh? This clears the form and ALL transactions below so you can begin new data entry.${warn}`)) {
       return;
     }
 
-    const snapshot = budgetData;
+    const snapshot = { rows: budgetData, unsaved: unsavedCount, source };
     budgetData = [];
-    inlineEditIndex = -1;
+    selectedRows.clear();
+    source = null;
+    storeSourceHandle(null);
+    markSaved();
 
     // Reset every filter too, so the new session is truly blank
     filterStartDate.value = '';
@@ -2061,19 +3072,26 @@
     renderTable();
     window.scrollTo({ top: 0, behavior: 'smooth' });
     showStatus('✨ Fresh start — all transactions cleared.', false, () => {
-      budgetData = snapshot;
+      budgetData = snapshot.rows;
+      source = snapshot.source;
+      if (source && source.handle) storeSourceHandle(source.handle);
+      unsavedCount = 0;
+      markChanged(snapshot.unsaved || 0);
       renderTable();
       showStatus('↩️ Transactions restored.');
     });
   });
 
   // Press Enter anywhere in the entry form to add the transaction
-  document.querySelector('.controls .grid').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && e.target.tagName !== 'SELECT' &&
-        !e.target.closest('.category-picker-btn, .category-picker-panel')) {
-      e.preventDefault();
-      addEntry();
-    }
+  // (and in the edit dialog to save it)
+  [['#entryCard .entry-grid', addEntry], ['#editGrid', saveEdit]].forEach(([sel, fn]) => {
+    document.querySelector(sel).addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !['SELECT', 'BUTTON'].includes(e.target.tagName) &&
+          !e.target.closest('.category-picker-btn, .category-picker-panel')) {
+        e.preventDefault();
+        fn();
+      }
+    });
   });
 
   // Press Enter in Settings inputs to add the item
@@ -2091,20 +3109,196 @@
     });
   });
 
+  // ---- Buttons and controls ----
+  // Every button uses data-action instead of inline onclick, so the page's
+  // Content-Security-Policy can block inline scripts entirely.
+  const ACTIONS = {
+    openReportsHub: () => openReportsHub(),
+    openSettingsModal: () => openSettingsModal(),
+    openCompareModal: () => openCompareModal(),
+    toggleTheme: () => toggleTheme(),
+    addSettingItem: el => addSettingItem(el.dataset.key, el.dataset.input),
+    removeSettingItem: el => removeSettingItem(el.dataset.key, Number(el.dataset.index)),
+    addBudgetSetting: () => addBudgetSetting(),
+    removeBudgetByIndex: el => removeBudgetByIndex(Number(el.dataset.index)),
+    addCategorySetting: () => addCategorySetting(),
+    removeCategoryByIndex: el => removeCategoryByIndex(Number(el.dataset.index)),
+    addRecurringSetting: () => addRecurringSetting(),
+    removeRecurring: el => removeRecurring(Number(el.dataset.index)),
+    resetAllLocalData: () => resetAllLocalData(),
+    editRow: el => openEditor(Number(el.dataset.index)),
+    removeRow: el => removeRow(Number(el.dataset.index))
+  };
+
+  document.addEventListener('click', (e) => {
+    const el = e.target.closest('[data-action]');
+    if (el && Object.prototype.hasOwnProperty.call(ACTIONS, el.dataset.action)) {
+      e.preventDefault();
+      ACTIONS[el.dataset.action](el);
+      return;
+    }
+    const typeOpt = e.target.closest('.type-opt');
+    if (typeOpt) {
+      setEntryType(typeOpt.closest('.type-toggle'), typeOpt.dataset.type);
+      return;
+    }
+    const chip = e.target.closest('.date-chips .chip');
+    if (chip) {
+      e.preventDefault();
+      const input = document.getElementById(chip.parentElement.dataset.target);
+      input.value = dateOffsetStr(Number(chip.dataset.offset));
+      syncDateChips();
+    }
+  });
+
+  document.getElementById('currencySelect').addEventListener('change', (e) => setCurrencySetting(e.target.value));
+  ['date', 'editDate'].forEach(id => document.getElementById(id).addEventListener('input', syncDateChips));
+  document.getElementById('store').addEventListener('input', autofillFromStore);
+
+  // Phone: the + button opens the add form as a bottom sheet
+  document.getElementById('fab').addEventListener('click', openEntrySheet);
+  document.getElementById('entryClose').addEventListener('click', closeEntrySheet);
+  document.getElementById('sheetBackdrop').addEventListener('click', closeEntrySheet);
+
+  // Edit dialog
+  document.getElementById('editSave').addEventListener('click', saveEdit);
+  document.getElementById('editCancel').addEventListener('click', closeEditor);
+  document.getElementById('editDuplicate').addEventListener('click', duplicateFromEditor);
+  document.getElementById('editDelete').addEventListener('click', () => {
+    const i = editIndex;
+    closeEditor();
+    removeRow(i);
+  });
+  const closeEditBtn = document.getElementById('closeEdit');
+  closeEditBtn.addEventListener('click', closeEditor);
+  document.getElementById('editModal').addEventListener('click', (e) => {
+    if (e.target.id === 'editModal') closeEditor();
+  });
+
+  // Table rows: click or Enter opens the editor; checkboxes select
+  const tbodyEl = document.querySelector('#budgetTable tbody');
+  tbodyEl.addEventListener('click', (e) => {
+    if (e.target.closest('button, input, a')) return;
+    const tr = e.target.closest('tr.txn-row');
+    if (tr) openEditor(Number(tr.dataset.index));
+  });
+  tbodyEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && e.target.matches('tr.txn-row')) {
+      e.preventDefault();
+      openEditor(Number(e.target.dataset.index));
+    }
+  });
+  tbodyEl.addEventListener('change', (e) => {
+    if (!e.target.matches('.row-check')) return;
+    const row = budgetData[Number(e.target.dataset.index)];
+    if (!row) return;
+    if (e.target.checked) selectedRows.add(row);
+    else selectedRows.delete(row);
+    e.target.closest('tr').classList.toggle('selected', e.target.checked);
+    updateBulkBar();
+  });
+  document.getElementById('selectAll').addEventListener('change', (e) => {
+    getFilteredData().forEach(r => (e.target.checked ? selectedRows.add(r) : selectedRows.delete(r)));
+    renderTable();
+  });
+  document.getElementById('bulkApply').addEventListener('click', bulkSetCategory);
+  document.getElementById('bulkDelete').addEventListener('click', bulkDelete);
+  document.getElementById('bulkClear').addEventListener('click', () => {
+    selectedRows.clear();
+    renderTable();
+  });
+
+  // Draft restore bar
+  document.getElementById('draftRestore').addEventListener('click', restoreDraft);
+  document.getElementById('draftDiscard').addEventListener('click', discardDraft);
+
+  // Last line of defence if storage is unavailable: warn before leaving with unsaved work
+  window.addEventListener('beforeunload', (e) => {
+    if (unsavedCount > 0) {
+      e.preventDefault();
+      e.returnValue = '';
+    }
+  });
+
+  // ---- Keyboard & screen-reader support for every dialog ----
+  // When a dialog opens, focus moves into it and Tab stays inside; when it
+  // closes, focus returns to whatever opened it.
+  const FOCUSABLE = 'button:not([disabled]), [href], input:not([type="hidden"]):not([disabled]), select:not([disabled]), textarea, [tabindex]:not([tabindex="-1"])';
+  const openModal = () => [...document.querySelectorAll('.modal')].find(m => m.style.display === 'flex');
+  const focusReturn = new Map();
+  new MutationObserver(records => {
+    records.forEach(({ target: modal }) => {
+      const open = modal.style.display === 'flex';
+      if (open && !focusReturn.has(modal)) {
+        focusReturn.set(modal, document.activeElement);
+        if (!modal.contains(document.activeElement)) {
+          setTimeout(() => {
+            if (modal.contains(document.activeElement)) return;
+            const first = [...modal.querySelectorAll(FOCUSABLE)].find(el => el.offsetParent !== null);
+            if (first) first.focus();
+          }, 60);
+        }
+      } else if (!open && focusReturn.has(modal)) {
+        const back = focusReturn.get(modal);
+        focusReturn.delete(modal);
+        if (back && document.contains(back) && typeof back.focus === 'function') back.focus();
+      }
+    });
+  }).observe(document.body, { subtree: true, attributes: true, attributeFilter: ['style'] });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Tab') {
+      const modal = openModal();
+      if (!modal) return;
+      const items = [...modal.querySelectorAll(FOCUSABLE)].filter(el => el.offsetParent !== null);
+      if (!items.length) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (e.shiftKey && (document.activeElement === first || !modal.contains(document.activeElement))) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && (document.activeElement === last || !modal.contains(document.activeElement))) {
+        e.preventDefault();
+        first.focus();
+      }
+      return;
+    }
+    // Close buttons drawn as icons work with Enter/Space too
+    if ((e.key === 'Enter' || e.key === ' ') && e.target.matches && e.target.matches('.close[role="button"]')) {
+      e.preventDefault();
+      e.target.click();
+      return;
+    }
+    // Arrow keys move between Expense and Income
+    if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key) && e.target.matches && e.target.matches('.type-opt')) {
+      e.preventDefault();
+      const toggle = e.target.closest('.type-toggle');
+      const next = e.target.dataset.type === 'D' ? 'C' : 'D';
+      setEntryType(toggle, next);
+      toggle.querySelector(`.type-opt[data-type="${next}"]`).focus();
+    }
+  });
+
+  // Only the selected Expense/Income option is in the Tab order (radio-group behaviour)
+  const syncTypeTabIndex = () => document.querySelectorAll('.type-opt').forEach(b => {
+    b.tabIndex = b.getAttribute('aria-checked') === 'true' ? 0 : -1;
+  });
+  new MutationObserver(syncTypeTabIndex).observe(document.body, { subtree: true, attributes: true, attributeFilter: ['aria-checked'] });
+  syncTypeTabIndex();
+
   // Mirror tooltips as accessible names for icon-only buttons
   document.querySelectorAll('.action-btn[data-tooltip]').forEach(btn => {
     if (!btn.hasAttribute('aria-label')) btn.setAttribute('aria-label', btn.dataset.tooltip);
   });
 
+  applyLastUsed();
+  updateUnsavedBadge();
+  syncDateChips();
+  checkForDraft();
   renderTable();
 
-  // Caching is disabled: every visit loads fresh from the server.
-  // Also clean up the service worker and caches left by earlier versions.
-  if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.getRegistrations()
-      .then(regs => regs.forEach(r => r.unregister()))
-      .catch(() => {});
-  }
-  if ('caches' in window) {
-    caches.keys().then(keys => keys.forEach(k => caches.delete(k))).catch(() => {});
+  // Offline support: the service worker serves the app's own files from cache
+  // only when the network is unavailable (it never caches your transactions).
+  if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+    navigator.serviceWorker.register('sw.js').catch(() => {});
   }
