@@ -2,6 +2,7 @@
    Extracts the pure functions from app.js (no browser needed) and checks
    money precision, date normalization, and category detection. */
 const fs = require('fs');
+global.XLSX = require('./vendor/xlsx/xlsx.full.min.js');
 
 const src = fs.readFileSync(__dirname + '/app.js', 'utf8');
 
@@ -13,6 +14,8 @@ function extract(startMarker, endMarker) {
 }
 
 // Settings stub with one custom category to test user-keyword precedence
+// No remembered stores in unit tests (learned categories are browser-only)
+global.learnedCategory = () => '';
 global.getSettings = () => ({
   people: [], banks: [], budgets: {}, recurring: [],
   categories: { 'Lawn Care': ['lawn', 'mowing'] }
@@ -104,6 +107,58 @@ t('old file without Category column loads (serial date, numeric strings)', () =>
   eq(row['Debit [D]'], 85.5, 'debit');
   eq(row['Credit [C]'], '', 'credit');
   eq('Category' in row, false, 'no category key');
+});
+
+t('amounts typed as text are read correctly', () => {
+  eq(parseAmount('$1,234.56'), 1234.56);
+  eq(parseAmount(' 45.10 '), 45.1);
+  eq(parseAmount('(25.00)'), -25);
+  eq(parseAmount('25.00-'), -25);
+  eq(parseAmount('CA$ 12'), 12);
+  eq(parseAmount(''), '');
+  eq(parseAmount(87.5), 87.5);
+  const r = normalizeRow({ 'Date': '2026-11-02', 'Purchased Store': 'Shell', 'Debit [D]': '$1,060.40' });
+  eq(r['Debit [D]'], 1060.4, 'text debit kept');
+  eq(r['Amount Total'], 1060.4, 'total computed');
+});
+
+t('a negative debit becomes a credit (and the other way round)', () => {
+  const a = normalizeRow({ 'Date': '2026-11-02', 'Debit [D]': -50 });
+  eq(a['Debit [D]'], ''); eq(a['Credit [C]'], 50); eq(a['Amount Total'], 50);
+  const b = normalizeRow({ 'Date': '2026-11-02', 'Credit [C]': '(20.00)' });
+  eq(b['Debit [D]'], 20); eq(b['Credit [C]'], '');
+});
+
+t('total / balance rows in a sheet are not transactions', () => {
+  eq(isSummaryRow({ 'Purchased Store': 'Total', 'Debit [D]': 999 }), true);
+  eq(isSummaryRow({ 'Purchased Store': 'Grand total', 'Debit [D]': 999 }), true);
+  eq(isSummaryRow({ 'Date': '', 'Purchased Store': '', 'Debit [D]': 999 }), true, 'formula row');
+  eq(isSummaryRow({ 'Purchased Store': 'Total Wine & More', 'Date': '2026-11-02', 'Debit [D]': 40 }), false, 'dated store named Total is kept');
+  eq(isSummaryRow({ 'Purchased Store': 'Costco', 'Debit [D]': 40 }), false, 'undated purchase with a store is kept');
+  eq(isSummaryRow({ 'Date': '2026-11-02', 'Purchased Store': 'Costco', 'Debit [D]': 40 }), false);
+});
+
+t('every transaction sheet is read; notes sheets and total rows are skipped', () => {
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([['Shopping list'], ['milk']]), 'Notes');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet([
+    { 'Date': '2026-01-05', 'Purchased Store': 'Costco', 'Debit [D]': 100 },
+    { 'Date': '2026-01-09', 'Purchased Store': 'Payroll', 'Credit [C]': 4000 }
+  ]), 'Jan');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet([
+    { 'Date': '2026-02-03', 'Purchased Store': 'Rogers', 'Debit [D]': 95 },
+    { 'Date': '', 'Purchased Store': 'Total', 'Debit [D]': 95 }
+  ]), 'Feb');
+  const r = readWorkbookRows(wb);
+  eq(r.sheets.map(s => s.name).join(','), 'Jan,Feb');
+  eq(r.rows.length, 3);
+  eq(r.summaryRows, 1);
+});
+
+t('a file with unusual headers still opens its first sheet', () => {
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet([{ 'Purchased Store': 'Costco', 'Debit [D]': 10 }]), 'Sheet1');
+  eq(readWorkbookRows(wb).rows.length, 1);
 });
 
 // ---- Dashboard math ----
@@ -215,6 +270,145 @@ t('autocomplete: more-used store wins a tie; exact match and empty query give no
   eq(rankStoreSuggestions('tim', entries, 6)[0].name, 'Tims Pizza');
   eq(rankStoreSuggestions('tim hortons', entries, 6).length, 0);
   eq(rankStoreSuggestions('  ', entries, 6).length, 0);
+});
+
+// ---- Settle up ----
+t('settle up: two people', () => {
+  const t1 = settleUp({ Harsha: 30000, Cherry: 10000 });
+  eq(t1.length, 1); eq(t1[0].from, 'Cherry'); eq(t1[0].to, 'Harsha'); eq(t1[0].cents, 10000);
+});
+
+t('settle up: three people, cents balance exactly', () => {
+  const paid = { A: 10001, B: 0, C: 0 };
+  const tr = settleUp(paid);
+  const net = { A: paid.A, B: 0, C: 0 };
+  tr.forEach(x => { net[x.from] += x.cents; net[x.to] -= x.cents; });
+  const vals = Object.values(net);
+  eq(Math.max(...vals) - Math.min(...vals) <= 1, true, 'shares within 1 cent');
+  eq(tr.reduce((s, x) => s + x.cents, 0), 6667, 'total moved');
+});
+
+t('settle up: already even → nothing to pay', () => eq(settleUp({ A: 500, B: 500 }).length, 0));
+
+// ---- Subscription detection ----
+t('detects monthly charges with steady amounts, ignores one-offs and transfers', () => {
+  const rows = [
+    { 'Date': '2026-09-03', 'Purchased Store': 'Netflix', 'Debit [D]': 16.99 },
+    { 'Date': '2026-10-03', 'Purchased Store': 'Netflix', 'Debit [D]': 16.99 },
+    { 'Date': '2026-11-03', 'Purchased Store': 'netflix', 'Debit [D]': 17.49 },
+    { 'Date': '2026-10-10', 'Purchased Store': 'Best Buy', 'Debit [D]': 600 },
+    { 'Date': '2026-11-10', 'Purchased Store': 'Best Buy', 'Debit [D]': 40 },       // not steady
+    { 'Date': '2026-10-01', 'Purchased Store': 'TFSA contribution', 'Debit [D]': 500 },
+    { 'Date': '2026-11-01', 'Purchased Store': 'TFSA contribution', 'Debit [D]': 500 } // transfer
+  ];
+  const found = detectRecurring(rows, []);
+  eq(found.length, 1);
+  eq(found[0].desc, 'netflix');
+  eq(found[0].months, 3);
+  eq(found[0].day, 3);
+  eq(found[0].amount, 16.99);
+});
+
+t('already-recurring stores are not suggested again', () => {
+  const rows = [{ 'Date': '2026-10-03', 'Purchased Store': 'Rogers', 'Debit [D]': 95 }, { 'Date': '2026-11-03', 'Purchased Store': 'Rogers', 'Debit [D]': 95 }];
+  eq(detectRecurring(rows, [{ desc: 'rogers' }]).length, 0);
+});
+
+// ---- Year summary ----
+t('year summary: per-category months, refunds subtracted, transfers excluded', () => {
+  const rows = [
+    { 'Date': '2026-01-05', 'Purchased Store': 'Costco', 'Debit [D]': 100 },
+    { 'Date': '2026-01-20', 'Purchased Store': 'Costco refund', 'Credit [C]': 20 },
+    { 'Date': '2026-03-01', 'Purchased Store': 'Payroll', 'Credit [C]': 3000 },
+    { 'Date': '2026-03-02', 'Purchased Store': 'Amex credit card payment', 'Debit [D]': 500 },
+    { 'Date': '2025-12-31', 'Purchased Store': 'Costco', 'Debit [D]': 999 }
+  ];
+  const y = yearSummary(rows, '2026');
+  eq(y.categories.length, 1);
+  eq(y.categories[0].name, 'Groceries');
+  eq(y.categories[0].months[0], 8000, 'Jan net of refund');
+  eq(y.spent[2], 0, 'card payment not spending');
+  eq(y.income[2], 300000);
+  eq(y.net[0], -8000);
+});
+
+// ---- Name cleanup ----
+t('nameKey ignores case, punctuation and store numbers', () => {
+  eq(nameKey('COSTCO #512'), 'costco');
+  eq(nameKey('Costco 512'), 'costco');
+  eq(nameKey('  Tim  Hortons. '), 'tim hortons');
+  eq(nameKey('7-Eleven'), 'eleven'); // digits-only token dropped; still one key for every branch
+});
+
+t('similar names are suggested; different ones are not', () => {
+  const n = (name, count = 1) => ({ key: nameKey(name), name, count });
+  const pairs = findSimilarNames([n('House rent', 5), n('Home rent', 3), n('Netflix'), n('Rogers'), n('Shell'), n('Shell Gas')], new Set());
+  const ids = pairs.map(p => p.id);
+  eq(ids.includes('home rent|house rent'), true, 'house/home rent');
+  eq(ids.includes('shell|shell gas'), true, 'shell / shell gas');
+  eq(ids.some(id => id.includes('netflix')), false, 'netflix not paired');
+});
+
+t('a pair you marked "not the same" is not suggested again', () => {
+  const n = name => ({ key: nameKey(name), name, count: 1 });
+  eq(findSimilarNames([n('House rent'), n('Home rent')], new Set(['home rent|house rent'])).length, 0);
+});
+
+// ---- Notes, goals, reminders ----
+t('notes column is optional: old files load, new files keep the note', () => {
+  eq('Notes' in normalizeRow({ 'Date': '2026-11-01', 'Debit [D]': 5 }), false);
+  eq(normalizeRow({ 'Date': '2026-11-01', 'Debit [D]': 5, 'Notes': '  Banff   trip ' })['Notes'], 'Banff trip');
+});
+
+t('goal plan: amount left and per-month need, this month included', () => {
+  const p = goalPlan({ target: 3000, saved: 600, by: '2027-04' }, '2026-11');
+  eq(p.leftC, 240000);
+  eq(p.monthsLeft, 6);          // Nov..Apr
+  eq(p.perMonthC, 40000);       // $400 a month
+  eq(Math.round(p.pct), 20);
+  eq(goalPlan({ target: 100, saved: 100, by: '' }, '2026-11').done, true);
+});
+
+t('reminders: bills due within 5 days or overdue, unless recorded or dismissed', () => {
+  const rec = [
+    { desc: 'Rent', amount: 1800, day: 30, type: 'D' },
+    { desc: 'Rogers', amount: 95, day: 7, type: 'D' },
+    { desc: 'Netflix', amount: 16.99, day: 3, type: 'D' },
+    { desc: 'Payroll', amount: 4200, day: 1, type: 'C' }
+  ];
+  const rows = [{ 'Date': '2026-11-03', 'Purchased Store': 'NETFLIX', 'Debit [D]': 16.99 }];
+  const due = dueReminders(rec, rows, '2026-11-26', 5, new Set());
+  eq(due.map(d => d.rec.desc).join(','), 'Rogers,Rent', 'overdue first; recorded and income skipped');
+  eq(due[0].overdue, true);
+  eq(due[1].daysUntil, 4);
+  eq(dueReminders(rec, rows, '2026-11-26', 5, new Set(['rogers|2026-11'])).length, 1, 'dismissed');
+  eq(dueReminders([{ desc: 'Rent', amount: 1, day: 31, type: 'D' }], [], '2026-11-28', 5, new Set())[0].date, '2026-11-30', 'day 31 → last day');
+});
+
+// ---- Editing built-in categories ----
+t('renamed, re-keyworded and hidden categories apply everywhere; locked ones stay', () => {
+  const original = global.getSettings;
+  const base = original();
+  global.getSettings = () => ({ ...base, categoryEdits: {
+    'SPA': { name: 'Personal care', formerNames: ['Beauty'] },
+    'Movie': { hidden: true },
+    'Income': { hidden: true },                    // locked: must stay
+    'Fitness': { keywords: ['climbing gym'] }
+  } });
+  invalidateCategoryCache();
+  try {
+    eq(categorizeStore('Great Clips haircut'), 'Personal care', 'renamed category matches');
+    eq(getCategory({ 'Category': 'SPA' }), 'Personal care', 'old name in a file maps to the new one');
+    eq(getCategory({ 'Category': 'Beauty' }), 'Personal care', 'an earlier rename maps too');
+    eq(Object.keys(getCategoryMap()).includes('Movie'), false, 'hidden category gone');
+    eq(categorizeStore('Netflix') === 'Movie', false, 'its stores match something else');
+    eq(categorizeStore('Payroll'), 'Income', 'Income cannot be hidden');
+    eq(categorizeStore('Downtown Climbing Gym'), 'Fitness', 'new keyword works');
+    eq(categorizeStore('Goodlife'), 'Other', 'old keyword replaced');
+  } finally {
+    global.getSettings = original;
+    invalidateCategoryCache();
+  }
 });
 
 // ---- Budgets ----

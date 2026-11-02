@@ -40,8 +40,10 @@ function makeOldExcel(file) {
   });
   // A card payment that must not count as spending
   rows.push({ 'Date': new Date(today.getFullYear(), today.getMonth(), 1), 'Purchased By': 'Harsha', 'Purchased Store': 'Amex credit card payment', 'Bank Name': 'Scotia Debit', 'Debit [D]': 500, 'Credit [C]': '', 'Amount Total': 500 });
+  // A hand-made "Total" line at the bottom must not count as a transaction
+  const withTotal = rows.concat([{ 'Date': '', 'Purchased By': '', 'Purchased Store': 'Total', 'Bank Name': '', 'Debit [D]': 9999, 'Credit [C]': '', 'Amount Total': 9999 }]);
   const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows, { cellDates: true }), 'Sheet1');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(withTotal, { cellDates: true }), 'Sheet1');
   fs.writeFileSync(file, XLSX.write(wb, { bookType: 'xlsx', type: 'buffer' }));
   return rows.length;
 }
@@ -111,6 +113,15 @@ const server = http.createServer((req, res) => {
     await p.$eval(sel, el => el.scrollIntoView({ block: 'center' }));
     await p.click(sel);
   };
+  // Header buttons on desktop, the Menu on phones
+  const menu = async (action) => {
+    if (await p.$eval('#menuBtn', el => el.offsetParent !== null)) {
+      await p.click('#menuBtn'); await sleep(120);
+      await p.click(`#menuOptions [data-action="${action}"]`);
+    } else {
+      await p.click(`.header-actions [data-action="${action}"]`);
+    }
+  };
   const vis = sel => p.$eval(sel, el => getComputedStyle(el).display !== 'none' && !el.hidden).catch(() => false);
   const text = sel => p.$eval(sel, el => el.textContent.trim()).catch(() => null);
   const shot = async (name, sel) => {
@@ -128,20 +139,24 @@ const server = http.createServer((req, res) => {
 
   // Menu
   for (const [action, modal] of [['openReportsHub', '#reportsHubModal'], ['openSettingsModal', '#settingsModal'], ['openCompareModal', '#compareMonthsModal']]) {
-    await p.click('#menuBtn'); await sleep(120);
-    await p.click(`[data-action="${action}"]`); await sleep(200);
+    await menu(action); await sleep(200);
     ok(`menu ${action} opens`, await vis(modal));
     ok(`menu ${action} moves focus into dialog`, await p.evaluate(m => document.querySelector(m).contains(document.activeElement), modal));
     await p.keyboard.press('Escape'); await sleep(120);
     ok(`menu ${action} closes`, !(await vis(modal)));
   }
   const theme0 = await p.evaluate(() => document.documentElement.getAttribute('data-theme'));
-  await p.click('#menuBtn'); await sleep(120); await p.click('[data-action="toggleTheme"]'); await sleep(120);
+  await menu('toggleTheme'); await sleep(120);
   ok('theme toggles', await p.evaluate(() => document.documentElement.getAttribute('data-theme')) !== theme0);
   await p.evaluate(() => { document.documentElement.setAttribute('data-theme', 'light'); updateThemeUI('light'); });
 
+  ok('welcome screen on a blank start', await vis('#dashEmpty') && !(await vis('#overviewSection .kpi-grid')));
+
+  ok('one Upload button (no separate Excel/PDF buttons)', await vis('#uploadBtn') && !(await p.$('#uploadMenu')));
+
   // Open old Excel
   await (await p.$('#uploadFile')).uploadFile(excel); await sleep(700);
+  ok('welcome screen gives way to the dashboard', !(await vis('#dashEmpty')) && await vis('#overviewSection .kpi-grid'));
   ok('opens old-format Excel', await p.evaluate(() => budgetData.length) === excelRows);
   const totals = await p.evaluate(m => periodTotals(budgetData.filter(r => r.Date.startsWith(m))), thisMonth);
   ok('card payment not counted as spending', Math.abs(totals.spent - (85 + 140 + 16.99 + 60)) < 0.001, JSON.stringify(totals));
@@ -219,8 +234,14 @@ const server = http.createServer((req, res) => {
   ok('re-import: duplicates unticked', await p.$$eval('.imp-check', cs => cs.every(c => !c.checked)));
   await p.click('#importCancel');
 
+  // The single Upload picker routes a PDF to the statement review
+  await (await p.$('#uploadAny')).uploadFile(bankPdf);
+  await p.waitForFunction(() => document.getElementById('importModal').style.display === 'flex', { timeout: 15000 }).catch(() => {});
+  ok('Upload routes a PDF to the statement review', await vis('#importModal'));
+  await p.click('#importCancel'); await sleep(100);
+
   // Settings
-  await p.click('#menuBtn'); await sleep(100); await p.click('[data-action="openSettingsModal"]'); await sleep(150);
+  await menu('openSettingsModal'); await sleep(150);
   await p.type('#newPersonName', 'Alex'); await p.click('[data-action="addSettingItem"][data-key="people"]'); await sleep(80);
   ok('settings add person', await p.evaluate(() => getSettings().people.includes('Alex')));
   await p.type('#budgetTarget', 'Groceries'); await p.type('#budgetAmount', '0'); await p.click('[data-action="addBudgetSetting"]'); await sleep(80);
@@ -234,17 +255,242 @@ const server = http.createServer((req, res) => {
   const lastDay = new Date(today.getFullYear(), today.getMonth() + 1, 0).getDate();
   ok('recurring day 31 clamps', await p.evaluate(d => budgetData.some(r => r.Date === d && r['Purchased Store'] === 'Rent'), `${thisMonth}-${pad(Math.min(31, lastDay))}`));
 
+  // 3. Learned category: change Walmart to Shopping once, a new Walmart row follows
+  const wIdx = await p.evaluate(() => budgetData.findIndex(r => r['Purchased Store'] === 'Walmart'));
+  await tap(`[data-action="editRow"][data-index="${wIdx}"]`); await sleep(200);
+  await p.select('#editCategory', 'Shopping'); await p.click('#editSave'); await sleep(150);
+  ok('learned category applies to new rows', await p.evaluate(() => getCategory({ 'Purchased Store': 'walmart' })) === 'Shopping');
+
+  // 5. Amount search and click-to-filter
+  await p.$eval('#searchInput', el => { el.value = '16.99'; el.dispatchEvent(new Event('input')); }); await sleep(350);
+  ok('search by amount', await p.evaluate(() => getFilteredData().length > 0 && getFilteredData().every(r => toCents(r['Amount Total']) === 1699)));
+  await p.click('#clearFilterBtn'); await sleep(150);
+  await tap('#dashTopStores .top-item'); await sleep(300);
+  ok('top store click filters table', (await p.$eval('#searchInput', el => el.value)).length > 0 && (await p.$$('#budgetTable tbody tr.txn-row')).length > 0);
+  await p.evaluate(() => filterTableTo({ category: 'Groceries' })); await sleep(150);
+  ok('category chip shows', await vis('#categoryChip'));
+  await p.click('#categoryChipClear'); await sleep(100);
+  ok('category chip clears', !(await vis('#categoryChip')));
+  await p.click('#clearFilterBtn'); await sleep(100);
+
+  // 4. Settle up appears once two people have spending
+  await p.evaluate(() => { budgetData.filter(r => r['Purchased Store'] === 'Costco').forEach(r => { r['Purchased By'] = 'Cherry'; }); renderTable(); });
+  ok('settle-up panel shows who pays whom', await vis('#settlePanel') && /pays|even/.test(await text('#settleList') || ''));
+
+  // 7. Split: $40 of a row into Home, totals unchanged
+  const sIdx = await p.evaluate(() => budgetData.findIndex(r => toCents(r['Debit [D]']) > 5000 && r['Purchased Store'] === 'Costco'));
+  const spentBeforeSplit = await p.evaluate(() => periodTotals(budgetData).spent);
+  await tap(`[data-action="editRow"][data-index="${sIdx}"]`); await sleep(200);
+  await p.click('#editSplit'); await sleep(80);
+  await p.type('#splitAmount', '40'); await p.select('#splitCategory', 'Home'); await p.click('#splitApply'); await sleep(150);
+  ok('split makes two rows with the same total', await p.evaluate((i, before) =>
+    budgetData[i + 1]['Category'] === 'Home' && toCents(budgetData[i + 1]['Debit [D]']) === 4000 &&
+    Math.abs(periodTotals(budgetData).spent - before) < 0.001, sIdx, spentBeforeSplit));
+
+  // 6. Subscriptions found (Netflix appears in two months in the fixture)
+  await menu('openSettingsModal'); await sleep(150);
+  ok('detected recurring shown', await vis('#recurringDetected') && /Netflix/i.test(await text('#recurringDetectedList') || ''));
+  // 9. Currency
+  await p.select('#currencySelect', 'eur'); await sleep(100);
+  ok('euro currency', (await text('.amount-cur')) === '€');
+  await p.select('#currencySelect', 'dollar'); await sleep(100);
+  await p.keyboard.press('Escape'); await sleep(100);
+
+  // 8. Year summary + export
+  await menu('openReportsHub'); await sleep(100);
+  await p.click('#showSpendingCategory'); await sleep(250);
+  ok('report chart opens', await vis('#spendingCategoryModal'));
+  await p.click('#spendingCategoryModal [data-action="backToReports"]'); await sleep(150);
+  ok('"All reports" goes back to the list', await vis('#reportsHubModal') && !(await vis('#spendingCategoryModal')));
+  ok('category badges have icons', (await p.$$('#budgetTable .category-badge i')).length > 0);
+  await p.click('#showYearSummary'); await sleep(200);
+  ok('year summary opens', await vis('#yearModal') && (await p.$$('#yearTable tbody tr')).length > 0);
+  await shot('year.png', '.year-content');
+  await p.click('#yearExport'); await sleep(1200);
+  const summaryFile = fs.readdirSync(DL).find(f => /Summary\.xlsx$/.test(f));
+  ok('year summary exports', !!summaryFile);
+  if (summaryFile) fs.unlinkSync(path.join(DL, summaryFile));
+  await p.keyboard.press('Escape'); await sleep(100);
+
+  // Transactions collapse arrow sits at the far right of its header (like Overview)
+  const arrowRight = await p.evaluate(() => {
+    const head = document.querySelector('.table-section .table-header').getBoundingClientRect();
+    const btn = document.querySelector('[data-collapse="table"]').getBoundingClientRect();
+    return head.right - btn.right;
+  });
+  ok('Transactions arrow is on the right', arrowRight >= 0 && arrowRight < 8, String(arrowRight));
+
+  // Similar names: suggest, merge, and the dashboard groups them
+  await p.evaluate(() => {
+    budgetData.push(normalizeRow({ 'Date': `${dashActive}-03`, 'Purchased Store': 'House rent', 'Debit [D]': 900, 'Amount Total': 900 }));
+    budgetData.push(normalizeRow({ 'Date': `${dashActive}-04`, 'Purchased Store': 'Home rent', 'Debit [D]': 900, 'Amount Total': 900 }));
+    renderTable();
+  });
+  await menu('openReportsHub'); await sleep(100); await p.click('#showYearSummary'); await sleep(250);
+  ok('similar names suggested', /House rent/.test(await text('#yearNames') || '') && /Home rent/.test(await text('#yearNames') || ''));
+  const pairBtn = await p.evaluateHandle(() => [...document.querySelectorAll('[data-action="mergeSuggestion"]')].find(b => /House rent/.test(b.textContent)));
+  await pairBtn.click(); await sleep(250);
+  ok('merge saved', await p.evaluate(() => getSettings().aliases['home rent'] === 'House rent'));
+  await p.keyboard.press('Escape'); await sleep(100);
+  const storeNames = await p.$$eval('#dashTopStores .top-name', els => els.map(e => e.textContent));
+  ok('dashboard counts merged names as one', storeNames.filter(n => n === 'House rent').length === 1 && !storeNames.includes('Home rent'), storeNames.join('|'));
+  await p.evaluate(() => { budgetData = budgetData.filter(r => !/^(house|home) rent$/i.test(r['Purchased Store'])); renderTable(); });
+
+  // Collapse a section, and it stays collapsed after a reload
+  await tap('[data-collapse="entry"]'); await sleep(100);
+  ok('collapse hides the add form', !(await vis('#entryCard .controls')));
+  ok('collapse state remembered', await p.evaluate(() => JSON.parse(localStorage.getItem('spendwise_collapsed')).entry === true));
+  await tap('[data-collapse="entry"]'); await sleep(100);
+  ok('expand shows it again', await vis('#entryCard .controls'));
+
+  // Year report from separate monthly files (the list on screen is not changed)
+  const monthFiles = [];
+  for (const [i, m] of [[0, 'Jan'], [1, 'Feb'], [2, 'Mar']]) {
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet([
+      { 'Date': `2025-${pad(i + 1)}-01`, 'Purchased By': 'Harsha', 'Purchased Store': 'Payroll', 'Bank Name': 'Scotia Debit', 'Debit [D]': '', 'Credit [C]': 1000, 'Amount Total': 1000 },
+      { 'Date': `2025-${pad(i + 1)}-05`, 'Purchased By': 'Harsha', 'Purchased Store': 'Costco', 'Bank Name': 'Amex', 'Debit [D]': 100, 'Credit [C]': '', 'Amount Total': 100 }
+    ]), 'Sheet1');
+    const f = path.join(TMP, `${m}-2025.xlsx`);
+    fs.writeFileSync(f, XLSX.write(wb, { bookType: 'xlsx', type: 'buffer' }));
+    monthFiles.push(f);
+  }
+  monthFiles.push(monthFiles[1]); // same file twice → counted once
+  const listBefore = await p.evaluate(() => budgetData.length);
+  await menu('openReportsHub'); await sleep(100); await p.click('#showYearSummary'); await sleep(200);
+  await (await p.$('#yearFilesInput')).uploadFile(...monthFiles); await sleep(900);
+  ok('year files load without touching the list', await p.evaluate(() => budgetData.length) === listBefore);
+  ok('year files: 3 months, duplicates once', /3 of 12 months/.test(await text('#yearMonths') || '') && /6 transactions/.test(await text('#yearSourceTitle') || ''), await text('#yearSourceTitle'));
+  await p.evaluate(() => { window.print = () => { window.__printed = true; }; });
+  await p.click('#yearPdf'); await sleep(400);
+  const report = await p.$eval('#printReport', el => el.textContent.replace(/\s+/g, ' '));
+  ok('PDF report opens print with month-by-month figures', await p.evaluate(() => window.__printed === true) &&
+    /2025 Annual Report/.test(report) && /January\s*\$1,000\.00\s*\$100\.00\s*\$900\.00\s*90%/.test(report), report.slice(0, 160));
+  await p.evaluate(() => window.dispatchEvent(new Event('afterprint')));
+  await p.click('#yearUseScreen'); await sleep(100);
+  await p.keyboard.press('Escape'); await sleep(100);
+
+  // Notes / tags
+  await tap('#store'); await p.keyboard.type('Lake Louise Inn'); await p.keyboard.press('Escape');
+  await p.type('#amount', '210'); await p.type('#notes', 'Banff trip');
+  await tap('#addBtn'); await sleep(200);
+  ok('note saved on the row', await p.evaluate(() => budgetData.some(r => r['Notes'] === 'Banff trip')));
+  await tap('.note-chip'); await sleep(200);
+  ok('note chip filters the table', (await p.$eval('#searchInput', el => el.value)) === 'Banff trip' && (await p.$$('#budgetTable tbody tr.txn-row')).length === 1);
+  await p.click('#clearFilterBtn'); await sleep(150);
+  const nChecks = await p.$$('.row-check'); await nChecks[0].click(); await nChecks[1].click(); await sleep(80);
+  await p.type('#bulkNote', 'Banff trip'); await p.click('#bulkNoteApply'); await sleep(150);
+  ok('bulk tagging', await p.evaluate(() => budgetData.filter(r => r['Notes'] === 'Banff trip').length) >= 2);
+
+  // Monthly PDF report (print is stubbed)
+  await p.evaluate(() => { window.__printed = false; window.print = () => { window.__printed = true; }; });
+  await tap('#downloadBtn'); await sleep(120);
+  ok('Save opens a menu with Excel and PDF', await vis('#saveMenu') && /Excel/.test(await text('#saveMenu') || '') && /PDF report/.test(await text('#saveMenu') || ''));
+  await p.click('#savePdfItem'); await sleep(400);
+  const monthReport = await p.$eval('#printReport', el => el.textContent.replace(/\s+/g, ' '));
+  ok('monthly PDF report', await p.evaluate(() => window.__printed) && /Report/.test(monthReport) && /All transactions/.test(monthReport) && /Banff trip/.test(monthReport), monthReport.slice(0, 120));
+  await p.evaluate(() => window.dispatchEvent(new Event('afterprint')));
+
+  // Savings goal
+  await menu('openSettingsModal'); await sleep(150);
+  await p.type('#goalName', 'Japan trip'); await p.type('#goalTarget', '3000');
+  await p.click('[data-action="addGoal"]'); await sleep(120);
+  await p.keyboard.press('Escape'); await sleep(100);
+  ok('goal panel shows', await vis('#goalsPanel'));
+  await p.$eval('#goalsList .goal-add input', el => { el.value = '450'; });
+  await tap('#goalsList [data-action="addToGoal"]'); await sleep(150);
+  ok('money added to goal', await p.evaluate(() => getSettings().goals[0].saved === 450) && /\$450\.00/.test(await text('#goalsList') || ''));
+
+  // Bill reminder: a bill due in 2 days that isn't recorded yet
+  await p.evaluate(() => {
+    const s = getSettings();
+    const d = new Date(); d.setDate(d.getDate() + 2);
+    const sameMonth = d.getMonth() === new Date().getMonth();
+    s.recurring.push({ desc: 'Water bill', amount: 42, day: sameMonth ? d.getDate() : new Date().getDate(), payer: 'Harsha', bank: 'Amex', type: 'D' });
+    saveSettings(s); renderTable();
+  });
+  ok('bill reminder shows', /Water bill/.test(await text('#reminders') || ''));
+  const rowsBeforeBill = await p.evaluate(() => budgetData.length);
+  const addIt = await p.evaluateHandle(() => [...document.querySelectorAll('#reminders .reminder')].find(el => /Water bill/.test(el.textContent)).querySelector('[data-action="recordReminder"]'));
+  await addIt.evaluate(el => el.click()); await sleep(150);
+  ok('"Add it" records the bill and clears the reminder', await p.evaluate(() => budgetData.length) === rowsBeforeBill + 1 && !/Water bill/.test(await text('#reminders') || ''));
+
+  // Footer brand: "Moneta™" sits together, centred
+  ok('footer brand aligned', await p.evaluate(() => getComputedStyle(document.querySelector('.app-footer .brand')).display !== 'inline-flex'));
+
+  // Large lists: first 300 rows drawn, totals still cover every row
+  const paged = await p.evaluate(() => {
+    const keep = budgetData;
+    const many = Array.from({ length: 650 }, (_, i) => normalizeRow({ 'Date': `2026-03-${String(1 + (i % 28)).padStart(2, '0')}`, 'Purchased Store': 'Bulk ' + i, 'Debit [D]': 1, 'Amount Total': 1 }));
+    budgetData = many;
+    renderTable();
+    const first = document.querySelectorAll('#budgetTable tr.txn-row').length;
+    const footer = document.querySelector('.table-totals').textContent;
+    document.querySelector('[data-action="showMoreRows"]').click();
+    const second = document.querySelectorAll('#budgetTable tr.txn-row').length;
+    budgetData = keep;
+    renderTable();
+    return { first, second, footer };
+  });
+  ok('large lists draw 300 rows, then 300 more', paged.first === 300 && paged.second === 600, JSON.stringify(paged));
+  ok('totals include rows not drawn yet', /650 transactions/.test(paged.footer) && /\$650\.00/.test(paged.footer), paged.footer);
+
   // Save: one file per month
   const n = await p.evaluate(() => budgetData.length);
-  await tap('#downloadBtn'); await sleep(1500);
+  await tap('#downloadBtn'); await sleep(120);
+  await p.click('#saveExcelItem'); await sleep(1500);
   const files = fs.readdirSync(DL);
   let saved = 0;
   files.forEach(f => { const wb = XLSX.read(fs.readFileSync(path.join(DL, f))); saved += XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]).length; });
   ok('every row saved once', saved === n, `${saved}/${n} in ${files.join(',')}`);
   ok('badge cleared', !(await vis('#unsavedBadge')));
 
+  // A workbook with a sheet per month: all sheets read, and Save puts each month back on its sheet
+  {
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([['My notes'], ['keep this']]), 'Notes');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet([
+      { 'Date': '2026-01-04', 'Purchased By': 'Harsha', 'Purchased Store': 'Costco', 'Bank Name': 'Amex', 'Debit [D]': 120, 'Credit [C]': '', 'Amount Total': 120 },
+      { 'Date': '2026-01-15', 'Purchased By': 'Harsha', 'Purchased Store': 'Payroll', 'Bank Name': 'Scotia Debit', 'Debit [D]': '', 'Credit [C]': 4200, 'Amount Total': 4200 }
+    ]), 'Jan 2026');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet([
+      { 'Date': '2026-02-06', 'Purchased By': 'Cherry', 'Purchased Store': 'Rogers', 'Bank Name': 'PC', 'Debit [D]': 95, 'Credit [C]': '', 'Amount Total': 95 }
+    ]), 'Feb 2026');
+    const multi = path.join(TMP, 'multi.xlsx');
+    fs.writeFileSync(multi, XLSX.write(wb, { bookType: 'xlsx', type: 'buffer' }));
+    await (await p.$('#uploadFile')).uploadFile(multi); await sleep(700);
+    ok('every month sheet is read (notes sheet ignored)', await p.evaluate(() => budgetData.length) === 3);
+    await p.evaluate(() => {
+      budgetData.push(normalizeRow({ 'Date': '2026-02-20', 'Purchased By': 'Harsha', 'Purchased Store': 'Shell', 'Debit [D]': 60, 'Amount Total': 60 }));
+      markChanged(); renderTable();
+    });
+    await tap('#downloadBtn'); await sleep(120);
+    await p.click('#saveExcelItem'); await sleep(1500);
+    const saved = XLSX.read(fs.readFileSync(path.join(DL, 'multi.xlsx')));
+    const count = name => XLSX.utils.sheet_to_json(saved.Sheets[name]).length;
+    ok('save keeps the sheet layout: Notes untouched, Jan 2 rows, Feb 2 rows',
+      saved.SheetNames.join('|') === 'Notes|Jan 2026|Feb 2026' && count('Jan 2026') === 2 && count('Feb 2026') === 2 &&
+      XLSX.utils.sheet_to_json(saved.Sheets['Notes'], { header: 1 })[1][0] === 'keep this', saved.SheetNames.join('|'));
+  }
+
+  // Settings → Categories: rename, hide, reset
+  await menu('openSettingsModal'); await sleep(150);
+  await p.click('#builtinCats [data-action="startCategoryEdit"][data-cat="SPA"]'); await sleep(80);
+  await p.$eval('#builtinCats .cat-edit-name', el => { el.value = 'Personal care'; });
+  await p.click('#builtinCats [data-action="saveCategoryEdit"][data-cat="SPA"]'); await sleep(150);
+  ok('rename a built-in category', await p.evaluate(() => categorizeStore('Great Clips haircut')) === 'Personal care' &&
+    await p.evaluate(() => [...document.getElementById('category').options].some(o => o.value === 'Personal care')));
+  await p.click('#builtinCats [data-action="toggleCategoryHidden"][data-cat="Movie"]'); await sleep(120);
+  ok('hide a category removes it from the picker', await p.evaluate(() => ![...document.getElementById('category').options].some(o => o.value === 'Movie')));
+  ok('Income cannot be hidden', !(await p.$('#builtinCats [data-action="toggleCategoryHidden"][data-cat="Income"]')));
+  await p.click('#builtinCats [data-action="resetCategoryEdit"][data-cat="SPA"]'); await sleep(120);
+  await p.click('#builtinCats [data-action="toggleCategoryHidden"][data-cat="Movie"]'); await sleep(120);
+  ok('reset brings the default back', await p.evaluate(() => categorizeStore('Great Clips haircut')) === 'SPA');
+  await shot('categories.png', '.settings-content');
+  await p.keyboard.press('Escape'); await sleep(100);
+
   // Compare months
-  await p.click('#menuBtn'); await sleep(100); await p.click('[data-action="openCompareModal"]'); await sleep(150);
+  await menu('openCompareModal'); await sleep(150);
   await (await p.$('#compareFilesInput')).uploadFile(excel); await sleep(800);
   ok('compare months summary', await vis('#comparisonSummary'));
   await p.keyboard.press('Escape');
@@ -254,6 +500,7 @@ const server = http.createServer((req, res) => {
   const nDraft = await p.evaluate(() => budgetData.length);
   await p.reload({ waitUntil: 'networkidle0' }); await sleep(300);
   ok('fresh visit is blank', await p.evaluate(() => budgetData.length) === 0);
+  ok('restore bar is visible at the top', await p.evaluate(() => scrollY === 0));
   await p.click('#store'); await p.keyboard.type('Wal'); await sleep(120);
   ok('stores are remembered across visits', (await p.$eval('#store', el => el.value)) === 'Walmart');
   await p.keyboard.press('Escape');
@@ -282,6 +529,11 @@ const server = http.createServer((req, res) => {
   ok('phone: nothing overflows', overflow.length === 0, overflow.join(' | '));
   await p.evaluate(() => { document.getElementById('statusMessage').style.display = 'none'; });
   await shot('phone.png');
+
+  // 10. Clear this device removes everything Moneta stored
+  await menu('openSettingsModal'); await sleep(150);
+  await Promise.all([p.waitForNavigation({ waitUntil: 'networkidle0' }), p.click('[data-action="clearDeviceData"]')]);
+  ok('clear device wipes stored data', await p.evaluate(() => Object.keys(localStorage).filter(k => k.startsWith('spendwise_')).length === 0));
 
   ok('no console or CSP errors', errs.length === 0, errs.slice(0, 3).join(' | '));
 

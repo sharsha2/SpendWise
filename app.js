@@ -7,8 +7,13 @@
   let source = null;
 
   // Currency display: a generic dollar sign by default, with INR as an option.
+  // Display only — amounts are never converted between currencies
   const CURRENCIES = {
     dollar: { symbol: '$', locale: undefined },
+    usd: { symbol: 'US$', locale: 'en-US' },
+    eur: { symbol: '€', locale: 'en-IE' },
+    gbp: { symbol: '£', locale: 'en-GB' },
+    aud: { symbol: 'A$', locale: 'en-AU' },
     inr: { symbol: '₹', locale: 'en-IN' }
   };
 
@@ -99,19 +104,13 @@
     return (n < 0 ? '-' : '') + activeCurrency.symbol + s;
   }
 
+  function seriesColors(theme, count) {
+    return Array.from({ length: count }, (_, i) => theme.palette[i] || theme.other);
+  }
+
   function withAlpha(hex, alpha) {
     const n = parseInt(hex.slice(1), 16);
     return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
-  }
-
-  function chartTitle(theme, text) {
-    return {
-      display: true,
-      text,
-      color: theme.ink,
-      font: { family: theme.fontFamily, size: 15, weight: '600' },
-      padding: { bottom: 4 }
-    };
   }
 
   function chartSubtitle(theme, text) {
@@ -297,11 +296,14 @@
 
   function invalidateCategoryCache() {
     categoryCache = null;
+    if (typeof aliasCache !== 'undefined') aliasCache = null; // merged names live in settings too
   }
 
-  function getCategoryGroups() {
-    if (categoryCache && categoryCache.groups) return categoryCache.groups;
-    const groups = {
+  // Categories whose meaning the totals depend on can be renamed but not hidden
+  const LOCKED_GROUPS = new Set(['Income', TRANSFER_GROUP]);
+
+  function defaultCategoryGroups() {
+    return {
       'Income': {
         'Income': ['payroll', 'salary', 'deposit', 'income', 'interest', 'intrest', 'cashback', 'rebate']
       },
@@ -357,10 +359,42 @@
         'Shopping': ['shop', 'shopping', 'store', 'mall', 'buy', 'retail', 'clothing', 'fashion', 'shoes', 'outlet', 'amazon', 'walmart', 'winners', 'dollarama']
       }
     };
-    const custom = getSettings().categories || {};
+  }
+
+  // Built-in categories with your edits applied (renamed, new keywords, hidden),
+  // plus your custom categories
+  function getCategoryGroups() {
+    if (categoryCache && categoryCache.groups) return categoryCache.groups;
+    const settings = getSettings();
+    const edits = settings.categoryEdits || {};
+    const renames = {};   // any earlier name → current name
+    const originals = {}; // current name → built-in name (keeps icons and colours)
+    const groups = {};
+    for (const [group, subs] of Object.entries(defaultCategoryGroups())) {
+      const out = {};
+      for (const [name, keywords] of Object.entries(subs)) {
+        const e = edits[name];
+        if (e && e.hidden && !LOCKED_GROUPS.has(group)) continue;
+        const shown = e && e.name ? e.name : name;
+        if (shown !== name) {
+          originals[shown] = name;
+          renames[name] = shown;
+          (e.formerNames || []).forEach(n => { if (n !== shown) renames[n] = shown; });
+        }
+        out[shown] = e && Array.isArray(e.keywords) && e.keywords.length ? e.keywords : keywords;
+      }
+      groups[group] = out;
+    }
+    const custom = settings.categories || {};
     if (Object.keys(custom).length) groups['Custom'] = custom;
-    categoryCache = { groups, map: null, groupOf: new Map(), storeCat: new Map() };
+    categoryCache = { groups, map: null, groupOf: new Map(), storeCat: new Map(), renames, originals };
     return groups;
+  }
+
+  // A category name from a file or an older version → what it's called now
+  function canonicalCategory(name) {
+    getCategoryGroups();
+    return categoryCache.renames[name] || name;
   }
 
   // Flat map (sub-category → keywords). Custom entries are inserted first so
@@ -399,6 +433,10 @@
       budgets: {}, // { "Groceries": 600 }
       recurring: [], // [ {desc, amount, day, payer, bank, type} ]
       categories: {}, // { "Pets": ["vet", "petsmart"] }
+      aliases: {},    // { "home rent": "House rent" }
+      notSame: [],    // ["home rent|house rent"] — pairs not to suggest again
+      goals: [],      // [{ id, name, target, saved, by: 'YYYY-MM' }]
+      categoryEdits: {}, // { "SPA": { name: "Personal care", keywords: [...], hidden: false, formerNames: [] } }
       currency: 'dollar' // 'dollar' (generic $) or 'inr' (₹)
     };
     let stored = null;
@@ -411,7 +449,18 @@
       budgets: isPlainObject(stored.budgets) ? stored.budgets : {},
       recurring: Array.isArray(stored.recurring) ? stored.recurring.filter(isPlainObject) : [],
       categories: isPlainObject(stored.categories) ? stored.categories : {},
-      currency: CURRENCIES[stored.currency] ? stored.currency : defaultSettings.currency
+      currency: CURRENCIES[stored.currency] ? stored.currency : defaultSettings.currency,
+      // Merged names: { nameKey of a variant: 'Name to show' } and pairs you said differ
+      aliases: isPlainObject(stored.aliases)
+        ? Object.fromEntries(Object.entries(stored.aliases).filter(([k, v]) => isSafeKey(k) && typeof v === 'string'))
+        : {},
+      notSame: Array.isArray(stored.notSame) ? stored.notSame.filter(x => typeof x === 'string') : [],
+      categoryEdits: isPlainObject(stored.categoryEdits)
+        ? Object.fromEntries(Object.entries(stored.categoryEdits).filter(([k, v]) => isSafeKey(k) && isPlainObject(v)))
+        : {},
+      goals: Array.isArray(stored.goals)
+        ? stored.goals.filter(g => isPlainObject(g) && typeof g.name === 'string' && isFinite(Number(g.target)))
+        : []
     };
   }
 
@@ -526,6 +575,149 @@
     populateSettingsUI();
   }
 
+  // ---- Built-in categories: rename, change keywords, hide ----
+  let editingCategory = null; // built-in name being edited inline
+
+  function shownNameOf(original) {
+    const e = getSettings().categoryEdits[original];
+    return e && e.name ? e.name : original;
+  }
+
+  function allCategoryNames() {
+    return Object.values(getCategoryGroups()).flatMap(subs => Object.keys(subs));
+  }
+
+  function renderBuiltinCategories() {
+    const edits = getSettings().categoryEdits;
+    const host = document.getElementById('builtinCats');
+    host.innerHTML = Object.entries(defaultCategoryGroups()).map(([group, subs]) =>
+      `<div class="cat-edit-group"><div class="cat-edit-group-name">${escapeHtml(group)}</div>` +
+      Object.entries(subs).map(([orig, defaults]) => {
+        const e = edits[orig] || {};
+        const shown = e.name || orig;
+        const keywords = Array.isArray(e.keywords) && e.keywords.length ? e.keywords : defaults;
+        const locked = LOCKED_GROUPS.has(group);
+        const changed = !!(e.name || (e.keywords && e.keywords.length) || e.hidden);
+        const id = escapeHtml(orig);
+        if (editingCategory === orig) {
+          return `<div class="cat-edit-row editing" data-cat="${id}">
+            <input type="text" class="cat-edit-name" value="${escapeHtml(shown)}" maxlength="40" aria-label="Category name">
+            <input type="text" class="cat-edit-keywords" value="${escapeHtml(keywords.join(', '))}" aria-label="Keywords, comma separated">
+            <span class="cat-edit-actions">
+              <button type="button" class="pill-btn primary" data-action="saveCategoryEdit" data-cat="${id}">Save</button>
+              <button type="button" class="pill-btn ghost" data-action="cancelCategoryEdit">Cancel</button>
+            </span></div>`;
+        }
+        return `<div class="cat-edit-row${e.hidden ? ' is-hidden' : ''}" data-cat="${id}">
+          <div class="cat-edit-text">${getCategoryBadge(shown)}${shown !== orig ? `<span class="cat-was">was ${id}</span>` : ''}${e.hidden ? '<span class="cat-was">hidden</span>' : ''}
+            <span class="cat-keywords">${escapeHtml(keywords.join(', '))}</span></div>
+          <span class="cat-edit-actions">
+            <button type="button" class="pill-btn ghost" data-action="startCategoryEdit" data-cat="${id}"><i class="fas fa-pen"></i> Edit</button>
+            ${locked ? '<span class="cat-lock" title=""><i class="fas fa-lock" aria-hidden="true"></i> Needed for totals</span>'
+              : `<button type="button" class="pill-btn ghost" data-action="toggleCategoryHidden" data-cat="${id}">${e.hidden ? '<i class="fas fa-eye"></i> Show' : '<i class="fas fa-eye-slash"></i> Hide'}</button>`}
+            ${changed ? `<button type="button" class="pill-btn ghost" data-action="resetCategoryEdit" data-cat="${id}">Reset</button>` : ''}
+          </span></div>`;
+      }).join('') + '</div>').join('');
+  }
+
+  // Renaming updates the rows on screen, budgets and remembered stores, so the
+  // next save uses the new name everywhere
+  function applyCategoryRename(oldName, newName) {
+    if (oldName === newName) return 0;
+    let changed = 0;
+    budgetData.forEach(r => { if (r['Category'] === oldName) { r['Category'] = newName; changed++; } });
+    const settings = getSettings();
+    if (Object.prototype.hasOwnProperty.call(settings.budgets, oldName)) {
+      settings.budgets[newName] = settings.budgets[oldName];
+      delete settings.budgets[oldName];
+      saveSettings(settings);
+    }
+    const mem = loadStoreMemory();
+    let memChanged = false;
+    Object.values(mem).forEach(m => { if (m.category === oldName) { m.category = newName; memChanged = true; } });
+    if (memChanged) { try { localStorage.setItem(STORE_KEY, JSON.stringify(mem)); } catch (e) { /* ignore */ } }
+    if (changed) markChanged(changed);
+    return changed;
+  }
+
+  function saveCategoryEdit(orig) {
+    const row = document.querySelector(`#builtinCats .cat-edit-row[data-cat="${CSS.escape(orig)}"]`);
+    if (!row) return;
+    const name = row.querySelector('.cat-edit-name').value.replace(/\s+/g, ' ').trim();
+    const keywords = row.querySelector('.cat-edit-keywords').value.split(',').map(k => k.trim().toLowerCase()).filter(Boolean);
+    const before = shownNameOf(orig);
+    if (!name || !isSafeKey(name)) { showStatus('⚠️ Give the category a name.', true); return; }
+    if (name !== before && allCategoryNames().some(n => n.toLowerCase() === name.toLowerCase())) {
+      showStatus(`⚠️ There's already a category called “${name}”.`, true);
+      return;
+    }
+    if (!keywords.length) { showStatus('⚠️ Keep at least one keyword so matching stores are found.', true); return; }
+    const settings = getSettings();
+    const defaults = defaultCategoryGroups();
+    const defaultKeywords = Object.values(defaults).map(subs => subs[orig]).find(Boolean) || [];
+    const e = settings.categoryEdits[orig] || {};
+    e.name = name !== orig ? name : undefined;
+    e.keywords = keywords.join('|') === defaultKeywords.join('|') ? undefined : keywords;
+    if (before !== name) e.formerNames = [...new Set([...(e.formerNames || []), before].filter(n => n !== name))];
+    settings.categoryEdits[orig] = JSON.parse(JSON.stringify(e)); // drops undefined fields
+    if (!Object.keys(settings.categoryEdits[orig]).length) delete settings.categoryEdits[orig];
+    saveSettings(settings);
+    const moved = applyCategoryRename(before, name);
+    editingCategory = null;
+    afterCategoriesChanged(before !== name
+      ? `🏷️ “${before}” is now “${name}”${moved ? ` (${moved} transaction${moved === 1 ? '' : 's'} updated)` : ''}`
+      : `🏷️ Keywords for “${name}” saved`);
+  }
+
+  function toggleCategoryHidden(orig) {
+    const settings = getSettings();
+    const e = settings.categoryEdits[orig] || {};
+    e.hidden = !e.hidden;
+    if (!e.hidden) delete e.hidden;
+    settings.categoryEdits[orig] = e;
+    if (!Object.keys(e).length) delete settings.categoryEdits[orig];
+    saveSettings(settings);
+    afterCategoriesChanged(e.hidden ? `🙈 “${shownNameOf(orig)}” hidden — its stores now match other categories` : `👁️ “${shownNameOf(orig)}” shown again`);
+  }
+
+  function resetCategoryEdit(orig) {
+    const before = shownNameOf(orig);
+    const settings = getSettings();
+    const formerNames = (settings.categoryEdits[orig] && settings.categoryEdits[orig].formerNames) || [];
+    delete settings.categoryEdits[orig];
+    // Keep mapping names you used before, so older files still find the category
+    if (before !== orig || formerNames.length) {
+      settings.categoryEdits[orig] = { formerNames: [...new Set([...formerNames, before].filter(n => n !== orig))] };
+    }
+    saveSettings(settings);
+    applyCategoryRename(before, orig);
+    afterCategoriesChanged(`↩️ “${orig}” is back to its default`);
+  }
+
+  function afterCategoriesChanged(message) {
+    populateCategoryDropdown();
+    populateSettingsUI();
+    renderTable();
+    showStatus(message);
+  }
+
+  let detectedRecurring = [];
+
+  function addDetectedRecurring(index) {
+    const r = detectedRecurring[index];
+    if (!r) return;
+    const settings = getSettings();
+    settings.recurring.push({
+      desc: r.desc, amount: r.amount, day: r.day,
+      payer: settings.people.includes(r.payer) ? r.payer : (settings.people[0] || ''),
+      bank: settings.banks.includes(r.bank) ? r.bank : (settings.banks[0] || ''),
+      type: r.type
+    });
+    saveSettings(settings);
+    populateSettingsUI();
+    showStatus(`🔁 ${r.desc} added to recurring.`);
+  }
+
   function populateSettingsUI() {
     const settings = getSettings();
     const pList = document.getElementById('peopleList');
@@ -558,6 +750,29 @@
     catList.innerHTML = Object.entries(settings.categories || {}).map(([name, kws], i) =>
       line(escapeHtml(name), escapeHtml(kws.join(', ')), `category ${name}`, `data-action="removeCategoryByIndex" data-index="${i}"`)).join('') ||
       empty('No custom categories yet.');
+
+    // Recurring suggestions found in the current transactions
+    detectedRecurring = detectRecurring(budgetData, settings.recurring);
+    const detectedBox = document.getElementById('recurringDetected');
+    detectedBox.hidden = !detectedRecurring.length;
+    document.getElementById('recurringDetectedList').innerHTML = detectedRecurring.map((r, i) =>
+      `<div class="settings-line"><div><strong>${escapeHtml(r.desc)}</strong>` +
+      `<span>${r.type === 'C' ? 'Income' : 'Expense'} ${fmtMoney(r.amount)} · around day ${r.day} · seen in ${r.months} months</span></div>` +
+      `<button type="button" class="pill-btn ghost" data-action="addDetectedRecurring" data-index="${i}"><i class="fas fa-plus"></i> Add</button></div>`).join('');
+
+    renderBuiltinCategories();
+
+    // Savings goals
+    document.getElementById('goalsSettingsList').innerHTML = settings.goals.map(g =>
+      line(escapeHtml(g.name), `${fmtMoney(g.saved)} of ${fmtMoney(g.target)}${g.by ? ' · by ' + escapeHtml(monthLabelOf(g.by, { month: 'short', year: 'numeric' })) : ''}`,
+        `goal ${g.name}`, `data-action="removeGoal" data-id="${escapeHtml(g.id)}"`)).join('') ||
+      empty('No goals yet.');
+
+    // Merged names
+    const aliasList = document.getElementById('aliasList');
+    aliasList.innerHTML = Object.entries(settings.aliases).map(([k, v]) =>
+      line(escapeHtml(k), `shown as “${escapeHtml(v)}”`, `merge ${k}`, `data-action="removeAlias" data-key="${escapeHtml(k)}"`)).join('') ||
+      empty('Nothing merged yet. Year summary suggests names that look alike.');
 
     // Budget suggestions: every category and group
     const groups = getCategoryGroups();
@@ -620,6 +835,23 @@
     }
   }
 
+  // Removes everything Moneta stores in this browser: settings, remembered
+  // stores, unsaved draft, linked file, theme and the offline cache.
+  async function clearDeviceData() {
+    const warn = unsavedCount ? `\n\n⚠️ ${unsavedCount} unsaved change${unsavedCount === 1 ? ' is' : 's are'} not saved to Excel yet and will be lost.` : '';
+    if (!confirm(`Remove all Moneta data from this browser?\n\nSettings, remembered stores, the unsaved draft and the offline copy are deleted. Your Excel files are not touched.${warn}`)) return;
+    try {
+      Object.keys(localStorage).filter(k => k.startsWith('spendwise_')).forEach(k => localStorage.removeItem(k));
+    } catch (e) { /* storage unavailable */ }
+    try { indexedDB.deleteDatabase('moneta'); } catch (e) { /* ignore */ }
+    try {
+      if ('caches' in window) await Promise.all((await caches.keys()).map(k => caches.delete(k)));
+      if ('serviceWorker' in navigator) (await navigator.serviceWorker.getRegistrations()).forEach(r => r.unregister());
+    } catch (e) { /* ignore */ }
+    unsavedCount = 0; // nothing left to protect, so leave without the warning
+    location.reload();
+  }
+
   function toggleTheme() {
     const currentTheme = document.documentElement.getAttribute('data-theme');
     const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
@@ -632,14 +864,18 @@
   function updateThemeUI(theme) {
     const themeIcon = document.getElementById('themeIcon');
     const themeText = document.getElementById('themeText');
+    const topIcon = document.getElementById('themeIconTop');
+    const topBtn = document.getElementById('themeToggleTop');
+    topIcon.className = theme === 'dark' ? 'fas fa-sun' : 'fas fa-moon';
+    topBtn.setAttribute('aria-label', theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode');
     if (theme === 'dark') {
       themeIcon.className = 'fas fa-sun';
-      themeText.textContent = 'Light Mode';
+      themeText.textContent = 'Light mode';
       Chart.defaults.color = '#CBD5E1';
       Chart.defaults.borderColor = '#2C3A52';
     } else {
       themeIcon.className = 'fas fa-moon';
-      themeText.textContent = 'Dark Mode';
+      themeText.textContent = 'Dark mode';
       Chart.defaults.color = '#334155';
       Chart.defaults.borderColor = '#E2E8F0';
     }
@@ -679,6 +915,7 @@
     filterMinAmount.value = '';
     filterMaxAmount.value = '';
     searchInput.value = '';
+    categoryFilter = '';
     document.getElementById('datePreset').value = 'all';
     renderTable();
     showStatus('🔍 Filters cleared');
@@ -715,16 +952,57 @@
   const sortableHeaders = document.querySelectorAll('th[data-sort]');
 
   addBtn.addEventListener('click', addEntry);
-  downloadBtn.addEventListener('click', downloadExcel);
   uploadFile.addEventListener('change', uploadExcel);
-  // Where supported, open the file through the File System Access API so we
-  // get a writable handle back; otherwise the plain file input is used.
-  if ('showOpenFilePicker' in window) {
-    uploadFile.closest('label').addEventListener('click', (e) => {
-      e.preventDefault();
-      pickAndLinkExcel();
+  // Small drop-down menus (Upload ▾ and Save ▾)
+  function setupMenu(buttonId, menuId, onOpen) {
+    const btn = document.getElementById(buttonId);
+    const menu = document.getElementById(menuId);
+    const items = () => [...menu.querySelectorAll('[role="menuitem"]')];
+    const close = (focusButton) => {
+      if (menu.hidden) return;
+      menu.hidden = true;
+      btn.setAttribute('aria-expanded', 'false');
+      if (focusButton) btn.focus();
+    };
+    const open = () => {
+      document.querySelectorAll('.pop-menu').forEach(m => { if (m !== menu) m.hidden = true; });
+      if (onOpen) onOpen();
+      menu.hidden = false;
+      btn.setAttribute('aria-expanded', 'true');
+      items()[0].focus();
+    };
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (menu.hidden) open(); else close(false);
     });
+    menu.addEventListener('click', (e) => {
+      if (e.target.closest('[role="menuitem"]')) close(false);
+    });
+    menu.addEventListener('keydown', (e) => {
+      const list = items();
+      const i = list.indexOf(document.activeElement);
+      if (e.key === 'ArrowDown') { e.preventDefault(); list[(i + 1) % list.length].focus(); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); list[(i - 1 + list.length) % list.length].focus(); }
+      else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(true); }
+      else if (e.key === 'Tab') close(false);
+    });
+    document.addEventListener('click', (e) => { if (!menu.contains(e.target) && e.target !== btn) close(false); });
   }
+
+  setupMenu('downloadBtn', 'saveMenu', () => {
+    const month = reportMonth();
+    document.getElementById('savePdfHint').textContent = month
+      ? `Summary of ${monthLabelOf(month, { month: 'long', year: 'numeric' })} to keep or share`
+      : 'Add transactions first';
+  });
+  document.getElementById('uploadBtn').addEventListener('click', chooseUploadFiles);
+  document.getElementById('uploadAny').addEventListener('change', (e) => {
+    const files = [...(e.target.files || [])]; // copy before clearing the input
+    e.target.value = '';
+    if (files.length) routeUploads(files);
+  });
+  document.getElementById('saveExcelItem').addEventListener('click', downloadExcel);
+  document.getElementById('savePdfItem').addEventListener('click', downloadMonthPdf);
   compareFilesInput.addEventListener('change', uploadMultipleExcel);
   clearBtn.addEventListener('click', clearTable);
   
@@ -805,8 +1083,9 @@
       showStatus('⚠️ No transactions to chart yet. Add entries or clear your filters.', true);
       return;
     }
-    updateFn();
+    // Show first: a chart drawn inside a hidden pop-up gets the wrong size
     modal.style.display = 'flex';
+    updateFn();
   }
 
   showIncomeExpense.addEventListener('click', () => openChart(updateIncomeExpenseChart, incomeExpenseModal));
@@ -814,6 +1093,645 @@
   showMonthlyOverview.addEventListener('click', () => openChart(updateMonthlyOverviewChart, monthlyOverviewModal));
   showCreditCardSpending.addEventListener('click', () => openChart(updateCreditCardSpendingChart, creditCardSpendingModal));
   showPurchasedByTrend.addEventListener('click', () => openChart(updatePurchasedByTrendChart, purchasedByTrendModal));
+
+  // ---- Year summary ----
+  const MONTH_SHORT = Array.from({ length: 12 }, (_, i) => new Date(2000, i, 1).toLocaleString('default', { month: 'short' }));
+
+  // The year report can use the on-screen transactions or a set of monthly
+  // files loaded just for the report (they never replace your list)
+  let yearRows = null;
+  let yearFileNames = [];
+  const yearData = () => yearRows || budgetData;
+
+  function yearsIn(rows) {
+    return [...new Set(rows.map(monthKeyOf).filter(Boolean).map(k => k.slice(0, 4)))].sort().reverse();
+  }
+
+  function fillYearSelect(preferred) {
+    const years = yearsIn(yearData());
+    const sel = document.getElementById('yearSelect');
+    const pick = years.includes(preferred) ? preferred : years.includes(sel.value) ? sel.value : years[0];
+    sel.innerHTML = years.map(y => `<option value="${y}">${y}</option>`).join('');
+    if (pick) sel.value = pick;
+    sel.disabled = !years.length;
+    ['yearExport', 'yearPdf'].forEach(id => { document.getElementById(id).disabled = !years.length; });
+  }
+
+  function updateYearSource(extra = '') {
+    const title = document.getElementById('yearSourceTitle');
+    const detail = document.getElementById('yearSourceDetail');
+    document.getElementById('yearUseScreen').hidden = !yearRows;
+    if (yearRows) {
+      title.textContent = `${yearFileNames.length} file${yearFileNames.length === 1 ? '' : 's'} loaded · ${yearRows.length} transactions`;
+      detail.textContent = extra || 'Only this report uses them — your transaction list is unchanged.';
+    } else {
+      title.textContent = budgetData.length ? `Using the ${budgetData.length} transactions on screen` : 'No transactions on screen';
+      detail.textContent = 'Load your monthly Excel files (all 12 if you have them) to build the full year.';
+    }
+  }
+
+  function openYearSummary() {
+    fillYearSelect();
+    updateYearSource();
+    renderYearSummary();
+    reportsHubModal.style.display = 'none';
+    document.getElementById('yearModal').style.display = 'flex';
+  }
+
+  // Reads every chosen file; a transaction already seen in an earlier file
+  // (e.g. two overlapping exports) is counted once
+  async function loadYearFiles(fileList) {
+    const files = [...fileList].sort((a, b) => a.name.localeCompare(b.name));
+    if (!files.length) return;
+    if (typeof XLSX === 'undefined') { showStatus('❌ Excel library not loaded. Please refresh.', true); return; }
+    const rows = [];
+    const seenBefore = new Set();
+    const problems = [];
+    let skipped = 0;
+    for (const file of files) {
+      try {
+        if (file.size > 20 * 1024 * 1024) throw new Error('larger than 20 MB');
+        const wb = XLSX.read(new Uint8Array(await file.arrayBuffer()), { type: 'array' });
+        const fileRows = readWorkbookRows(wb).rows;
+        const keysHere = new Set();
+        fileRows.forEach(r => {
+          const k = dupKey(r);
+          if (seenBefore.has(k)) { skipped++; return; }
+          keysHere.add(k);
+          rows.push(r);
+        });
+        keysHere.forEach(k => seenBefore.add(k));
+      } catch (e) {
+        problems.push(`${file.name} (${e.message})`);
+      }
+    }
+    if (!rows.length) {
+      showStatus(`❌ No transactions found${problems.length ? ': ' + problems.join(', ') : ''}`, true);
+      return;
+    }
+    yearRows = rows;
+    yearFileNames = files.map(f => f.name).filter(n => !problems.some(p => p.startsWith(n)));
+    // Default to the year most of the rows belong to
+    const counts = {};
+    rows.forEach(r => { const k = monthKeyOf(r); if (k) counts[k.slice(0, 4)] = (counts[k.slice(0, 4)] || 0) + 1; });
+    const busiest = Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0];
+    fillYearSelect(busiest);
+    const notes = [];
+    if (skipped) notes.push(`${skipped} duplicate${skipped === 1 ? '' : 's'} across files counted once`);
+    if (problems.length) notes.push(`couldn't read ${problems.join(', ')}`);
+    updateYearSource(notes.length ? notes.join(' · ') : '');
+    renderYearSummary();
+  }
+
+  function renderYearSummary() {
+    const year = document.getElementById('yearSelect').value;
+    const months = document.getElementById('yearMonths');
+    if (!year) {
+      months.innerHTML = '';
+      document.getElementById('yearTable').innerHTML = '<tbody><tr><td class="muted">No dated transactions yet — load your monthly files above.</td></tr></tbody>';
+      return;
+    }
+    const y = yearSummary(yearData(), year);
+    renderNameSuggestions(yearData().filter(r => (monthKeyOf(r) || '').startsWith(year + '-')), 'yearNames');
+    // Which months have data (missing months stand out before you export)
+    const present = new Set(yearData().map(monthKeyOf).filter(k => k && k.startsWith(year + '-')).map(k => Number(k.slice(5)) - 1));
+    months.innerHTML = MONTH_SHORT.map((m, i) =>
+      `<span class="month-chip ${present.has(i) ? 'has' : 'missing'}" title="">${present.has(i) ? '<i class="fas fa-check" aria-hidden="true"></i>' : ''}${m}</span>`).join('') +
+      `<span class="month-count">${present.size} of 12 months</span>`;
+    const cell = c => (c ? fmtMoney(c / 100) : '<span class="muted">–</span>');
+    const row = (label, months, cls = '') =>
+      `<tr class="${cls}"><th scope="row">${label}</th>${months.map(c => `<td class="right">${cell(c)}</td>`).join('')}` +
+      `<td class="right total">${cell(months.reduce((a, b) => a + b, 0))}</td></tr>`;
+    document.getElementById('yearTable').innerHTML =
+      `<thead><tr><th>Category</th>${MONTH_SHORT.map(m => `<th class="right">${m}</th>`).join('')}<th class="right">Total</th></tr></thead><tbody>` +
+      (y.categories.length ? y.categories.map(c => row(escapeHtml(c.name), c.months)).join('') : '<tr><td colspan="14" class="muted">No spending this year.</td></tr>') +
+      `</tbody><tfoot>${row('Spent', y.spent, 'sum')}${row('Income', y.income, 'sum')}${row('Net', y.net, 'sum net')}</tfoot>`;
+  }
+
+  function exportYearSummary() {
+    const year = document.getElementById('yearSelect').value;
+    const y = yearSummary(yearData(), year);
+    const toRow = (label, months) => {
+      const out = { Category: label };
+      MONTH_SHORT.forEach((m, i) => { out[m] = months[i] / 100; });
+      out.Total = months.reduce((a, b) => a + b, 0) / 100;
+      return out;
+    };
+    const rows = [...y.categories.map(c => toRow(c.name, c.months)), {}, toRow('Spent', y.spent), toRow('Income', y.income), toRow('Net', y.net)];
+    const ws = XLSX.utils.json_to_sheet(rows, { header: ['Category', ...MONTH_SHORT, 'Total'] });
+    ws['!cols'] = [{ wch: 24 }, ...MONTH_SHORT.map(() => ({ wch: 11 })), { wch: 12 }];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, `Summary ${year}`);
+    XLSX.writeFile(wb, `Moneta-${year}-Summary.xlsx`);
+    showStatus(`✅ Downloaded Moneta-${year}-Summary.xlsx`);
+  }
+
+  // ---- Annual PDF report (printed by the browser: choose "Save as PDF") ----
+  const REPORT_INK = { text: '#1E293B', muted: '#64748B', grid: '#E2E8F0', income: '#047857', expense: '#DC2626', net: '#2a78d6' };
+
+  // Renders a chart off-screen (always light colours) and returns it as an image
+  function chartImage(config, width, height) {
+    const canvas = document.createElement('canvas');
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+    canvas.width = width;
+    canvas.height = height;
+    config.options = Object.assign({ responsive: false, animation: false, devicePixelRatio: 2 }, config.options);
+    const chart = new Chart(canvas, config);
+    const url = canvas.toDataURL('image/png');
+    chart.destroy();
+    return url;
+  }
+
+  function buildAnnualReport(year) {
+    const rows = yearData().filter(r => (monthKeyOf(r) || '').startsWith(year + '-'));
+    const y = yearSummary(rows, year);
+    const sum = arr => arr.reduce((a, b) => a + b, 0);
+    const spentC = sum(y.spent);
+    const incomeC = sum(y.income);
+    const monthsWithData = y.spent.map((v, i) => (v || y.income[i] ? i : -1)).filter(i => i >= 0);
+    const avgSpendC = monthsWithData.length ? Math.round(spentC / monthsWithData.length) : 0;
+    const money = c => fmtMoney(c / 100);
+    const pct = (a, b) => (b ? `${((a / b) * 100).toFixed(1)}%` : '—');
+
+    // Highlights
+    const best = monthsWithData.slice().sort((a, b) => y.net[b] - y.net[a])[0];
+    const priciest = monthsWithData.slice().sort((a, b) => y.spent[b] - y.spent[a])[0];
+    let biggest = null;
+    rows.forEach(r => { const c = spendOf(r); if (c > 0 && (!biggest || c > biggest.c)) biggest = { c, r }; });
+    const stores = {};
+    rows.forEach(r => {
+      const c = spendOf(r);
+      if (!c) return;
+      const name = displayName(r['Purchased Store']) || '(no description)';
+      const key = nameKey(name) || name.toLowerCase();
+      stores[key] = stores[key] || { name, c: 0, n: 0 };
+      stores[key].c += c;
+      stores[key].n++;
+    });
+    const topStores = Object.values(stores).filter(s => s.c > 0).sort((a, b) => b.c - a.c).slice(0, 10);
+
+    // Per person: spending by month and category, plus income
+    const persons = {};
+    const personOf = r => String(r['Purchased By'] || '').trim() || 'Unassigned';
+    rows.forEach(r => {
+      const c = classify(r);
+      if (!c.spend && !c.income) return;
+      const who = personOf(r);
+      const p = persons[who] = persons[who] || { name: who, spent: 0, income: 0, months: new Array(12).fill(0), cats: {} };
+      p.income += c.income;
+      if (c.spend) {
+        p.spent += c.spend;
+        p.months[Number(monthKeyOf(r).slice(5, 7)) - 1] += c.spend;
+        const cat = getCategory(r);
+        p.cats[cat] = (p.cats[cat] || 0) + c.spend;
+      }
+    });
+    const personList = Object.values(persons).sort((a, b) => b.spent - a.spent);
+    const topCatsOf = p => Object.entries(p.cats).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]).slice(0, 3)
+      .map(([n, v]) => `${escapeHtml(n)} ${money(v)}`).join(' · ') || '—';
+
+    // Where the money came from, and each month's top spending category
+    const sources = {};
+    rows.forEach(r => {
+      const c = incomeOf(r);
+      if (!c) return;
+      const name = displayName(r['Purchased Store']) || 'Income';
+      const key = nameKey(name) || name.toLowerCase();
+      sources[key] = sources[key] || { name, c: 0, months: new Set() };
+      sources[key].c += c;
+      sources[key].months.add(monthKeyOf(r));
+    });
+    const incomeSources = Object.values(sources).filter(s => s.c > 0).sort((a, b) => b.c - a.c);
+    const topCatOfMonth = MONTH_SHORT.map((_, i) => {
+      const best = y.categories.filter(c => c.months[i] > 0).sort((a, b) => b.months[i] - a.months[i])[0];
+      return best ? best.name : '';
+    });
+
+    const light = { palette: CHART_PALETTE.light, other: '#64748B' };
+    const tick = { color: REPORT_INK.muted, font: { size: 11 } };
+    const monthlyImg = chartImage({
+      type: 'bar',
+      data: {
+        labels: MONTH_SHORT,
+        datasets: [
+          { label: 'Income', data: y.income.map(c => c / 100), backgroundColor: REPORT_INK.income, borderRadius: 3, maxBarThickness: 18 },
+          { label: 'Spent', data: y.spent.map(c => c / 100), backgroundColor: REPORT_INK.expense, borderRadius: 3, maxBarThickness: 18 }
+        ]
+      },
+      options: {
+        plugins: { legend: { labels: { color: REPORT_INK.text, boxWidth: 10, font: { size: 11 } } } },
+        scales: {
+          x: { grid: { display: false }, ticks: tick },
+          y: { beginAtZero: true, grid: { color: REPORT_INK.grid }, border: { display: false }, ticks: { ...tick, callback: v => fmtMoneyShort(v) } }
+        }
+      }
+    }, 700, 240);
+
+    const topCats = y.categories.slice(0, 8);
+    const restC = sum(y.categories.slice(8).map(c => c.total));
+    const catLabels = topCats.map(c => c.name).concat(restC ? [`Other (${y.categories.length - 8} more)`] : []);
+    const catValues = topCats.map(c => c.total / 100).concat(restC ? [restC / 100] : []);
+    const categoryImg = catValues.length ? chartImage({
+      type: 'bar',
+      data: { labels: catLabels, datasets: [{ data: catValues, backgroundColor: catLabels.map((_, i) => (restC && i === catLabels.length - 1) ? light.other : (light.palette[i] || light.other)), borderRadius: 3, maxBarThickness: 16 }] },
+      options: {
+        indexAxis: 'y',
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { beginAtZero: true, grid: { color: REPORT_INK.grid }, border: { display: false }, ticks: { ...tick, callback: v => fmtMoneyShort(v) } },
+          y: { grid: { display: false }, ticks: { ...tick, color: REPORT_INK.text } }
+        }
+      }
+    }, 700, Math.max(140, catLabels.length * 26 + 30)) : '';
+
+    const kpi = (label, value, cls = '') => `<div class="rp-kpi"><span>${label}</span><strong class="${cls}">${value}</strong></div>`;
+    const cell = c => (c ? money(c) : '–');
+    // 14-column grids use whole dollars so they fit an A4 page
+    const whole = c => {
+      const v = Math.round(c / 100);
+      return (v < 0 ? '−' : '') + activeCurrency.symbol + new Intl.NumberFormat(activeCurrency.locale).format(Math.abs(v));
+    };
+    const cellW = c => (c ? whole(c) : '–');
+    const sourceText = yearRows
+      ? `${yearFileNames.length} file${yearFileNames.length === 1 ? '' : 's'}: ${yearFileNames.map(escapeHtml).join(', ')}`
+      : 'Transactions on screen';
+    const missing = MONTH_SHORT.filter((_, i) => !monthsWithData.includes(i));
+
+    document.getElementById('printReport').innerHTML = `
+      <div class="rp">
+        <header class="rp-head">
+          <div><div class="rp-brand">Moneta</div><h1>${escapeHtml(year)} Annual Report</h1></div>
+          <div class="rp-meta">Generated ${escapeHtml(new Date().toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' }))}<br>${monthsWithData.length} of 12 months${missing.length && missing.length < 12 ? ` · missing ${escapeHtml(missing.join(', '))}` : ''}</div>
+        </header>
+        <p class="rp-source">Source: ${sourceText}</p>
+
+        <section class="rp-kpis">
+          ${kpi('Income', money(incomeC), 'inc')}
+          ${kpi('Spent', money(spentC), 'exp')}
+          ${kpi('Saved', money(incomeC - spentC), incomeC - spentC >= 0 ? 'inc' : 'exp')}
+          ${kpi('Savings rate', incomeC ? `${Math.round(((incomeC - spentC) / incomeC) * 100)}%` : '—')}
+          ${kpi('Avg. monthly spend', money(avgSpendC))}
+        </section>
+
+        <section class="rp-block">
+          <h2>Income and spending by month</h2>
+          <img src="${monthlyImg}" alt="Monthly income and spending, ${escapeHtml(year)}">
+        </section>
+
+        <section class="rp-block">
+          <h2>Month by month</h2>
+          <table class="rp-table rp-months">
+            <thead><tr><th>Month</th><th>Income</th><th>Spent</th><th>Saved</th><th>Savings rate</th><th>Top category</th></tr></thead>
+            <tbody>${MONTH_SHORT.map((m, i) => monthsWithData.includes(i)
+              ? `<tr><td>${new Date(Number(year), i, 1).toLocaleString('default', { month: 'long' })}</td><td class="inc">${money(y.income[i])}</td><td class="exp">${money(y.spent[i])}</td>` +
+                `<td class="${y.net[i] >= 0 ? 'inc' : 'exp'}">${y.net[i] < 0 ? '−' : ''}${money(Math.abs(y.net[i]))}</td>` +
+                `<td>${y.income[i] ? `${Math.round((y.net[i] / y.income[i]) * 100)}%` : '—'}</td><td>${escapeHtml(topCatOfMonth[i] || '—')}</td></tr>`
+              : `<tr class="rp-missing"><td>${new Date(Number(year), i, 1).toLocaleString('default', { month: 'long' })}</td><td colspan="5">No data</td></tr>`).join('')}</tbody>
+            <tfoot><tr><td>Year</td><td class="inc">${money(incomeC)}</td><td class="exp">${money(spentC)}</td>` +
+              `<td class="${incomeC - spentC >= 0 ? 'inc' : 'exp'}">${incomeC - spentC < 0 ? '−' : ''}${money(Math.abs(incomeC - spentC))}</td>` +
+              `<td>${incomeC ? `${Math.round(((incomeC - spentC) / incomeC) * 100)}%` : '—'}</td><td>${escapeHtml(y.categories[0] ? y.categories[0].name : '—')}</td></tr></tfoot>
+          </table>
+        </section>
+
+        ${incomeSources.length ? `
+        <section class="rp-block">
+          <h2>Income sources</h2>
+          <table class="rp-table">
+            <thead><tr><th>Source</th><th>Total</th><th>Share</th><th>Months</th></tr></thead>
+            <tbody>${incomeSources.map(s => `<tr><td>${escapeHtml(s.name)}</td><td class="inc">${money(s.c)}</td><td>${pct(s.c, incomeC)}</td><td>${s.months.size}</td></tr>`).join('')}</tbody>
+          </table>
+        </section>` : ''}
+
+        <section class="rp-highlights">
+          ${best !== undefined ? `<div><span>Best month</span><strong>${MONTH_SHORT[best]}</strong><em>saved ${money(y.net[best])}</em></div>` : ''}
+          ${priciest !== undefined ? `<div><span>Highest spending</span><strong>${MONTH_SHORT[priciest]}</strong><em>${money(y.spent[priciest])}</em></div>` : ''}
+          ${y.categories[0] ? `<div><span>Top category</span><strong>${escapeHtml(y.categories[0].name)}</strong><em>${pct(y.categories[0].total, spentC)} of spending</em></div>` : ''}
+          ${biggest ? `<div><span>Largest purchase</span><strong>${escapeHtml(biggest.r['Purchased Store'] || '—')}</strong><em>${money(biggest.c)} · ${escapeHtml(shortDate(biggest.r['Date']))}</em></div>` : ''}
+        </section>
+
+        ${categoryImg ? `<section class="rp-block"><h2>Where the money went</h2><img src="${categoryImg}" alt="Spending by category"></section>` : ''}
+
+        <section class="rp-block rp-two">
+          <div>
+            <h2>Categories</h2>
+            <table class="rp-table">
+              <thead><tr><th>Category</th><th>Total</th><th>Share</th><th>Per month</th></tr></thead>
+              <tbody>${y.categories.map(c => `<tr><td>${escapeHtml(c.name)}</td><td>${money(c.total)}</td><td>${pct(c.total, spentC)}</td><td>${money(Math.round(c.total / Math.max(1, monthsWithData.length)))}</td></tr>`).join('')}</tbody>
+            </table>
+          </div>
+          <div>
+            <h2>Top stores</h2>
+            <table class="rp-table">
+              <thead><tr><th>Store</th><th>Total</th><th>Visits</th></tr></thead>
+              <tbody>${topStores.map(s => `<tr><td>${escapeHtml(s.name)}</td><td>${money(s.c)}</td><td>${s.n}</td></tr>`).join('')}</tbody>
+            </table>
+
+          </div>
+        </section>
+
+        ${notesSummary(rows).length ? `
+        <section class="rp-block">
+          <h2>Notes &amp; tags</h2>
+          <table class="rp-table">
+            <thead><tr><th>Note / tag</th><th>Spent</th><th>Transactions</th></tr></thead>
+            <tbody>${notesSummary(rows).map(t => `<tr><td>${escapeHtml(t.name)}</td><td>${money(t.c)}</td><td>${t.n}</td></tr>`).join('')}</tbody>
+          </table>
+        </section>` : ''}
+
+        ${personList.length ? `
+        <section class="rp-block rp-break">
+          <h2>People</h2>
+          <table class="rp-table">
+            <thead><tr><th>Person</th><th>Spent</th><th>Share of spending</th><th>Avg. per month</th><th>Income</th><th>Top categories</th></tr></thead>
+            <tbody>${personList.map(p => `<tr><td><strong>${escapeHtml(p.name)}</strong></td><td class="exp">${money(p.spent)}</td><td>${pct(p.spent, spentC)}</td>` +
+              `<td>${money(Math.round(p.spent / Math.max(1, monthsWithData.length)))}</td><td class="inc">${p.income ? money(p.income) : '–'}</td><td class="rp-wrap">${topCatsOf(p)}</td></tr>`).join('')}</tbody>
+          </table>
+        </section>
+        <section class="rp-block">
+          <h2>Spending by person and month</h2>
+          <table class="rp-table rp-grid">
+            <thead><tr><th>Person</th>${MONTH_SHORT.map(m => `<th>${m}</th>`).join('')}<th>Total</th></tr></thead>
+            <tbody>${personList.map(p => `<tr><td>${escapeHtml(p.name)}</td>${p.months.map(v => `<td>${cellW(v)}</td>`).join('')}<td><strong>${whole(p.spent)}</strong></td></tr>`).join('')}</tbody>
+          </table>
+        </section>` : ''}
+
+        <section class="rp-block${personList.length ? '' : ' rp-break'}">
+          <h2>Category by month</h2>
+          <table class="rp-table rp-grid">
+            <thead><tr><th>Category</th>${MONTH_SHORT.map(m => `<th>${m}</th>`).join('')}<th>Total</th></tr></thead>
+            <tbody>${y.categories.map(c => `<tr><td>${escapeHtml(c.name)}</td>${c.months.map(v => `<td>${cellW(v)}</td>`).join('')}<td><strong>${whole(c.total)}</strong></td></tr>`).join('')}</tbody>
+            <tfoot>
+              <tr><td>Spent</td>${y.spent.map(v => `<td>${cellW(v)}</td>`).join('')}<td>${whole(spentC)}</td></tr>
+              <tr><td>Income</td>${y.income.map(v => `<td>${cellW(v)}</td>`).join('')}<td>${whole(incomeC)}</td></tr>
+              <tr><td>Net</td>${y.net.map(v => `<td>${cellW(v)}</td>`).join('')}<td>${whole(incomeC - spentC)}</td></tr>
+            </tfoot>
+          </table>
+          <p class="rp-note">Month grids are rounded to whole dollars; every other figure is exact to the cent. Refunds are subtracted from their category. Credit card payments, transfers between your accounts and investing are not counted as spending or income.</p>
+        </section>
+      </div>`;
+  }
+
+  // Opens the print dialog showing only #printReport ("Save as PDF" there)
+  function printReport(title) {
+    const previousTitle = document.title;
+    document.title = title; // becomes the suggested PDF file name
+    document.body.classList.add('print-report');
+    const done = () => {
+      document.body.classList.remove('print-report');
+      document.title = previousTitle;
+      window.removeEventListener('afterprint', done);
+    };
+    window.addEventListener('afterprint', done);
+    // Let the report images load before the print dialog opens
+    setTimeout(() => window.print(), 150);
+    showStatus('🖨️ In the print window choose "Save as PDF" as the destination.');
+  }
+
+  function downloadYearPdf() {
+    const year = document.getElementById('yearSelect').value;
+    if (!year) return;
+    buildAnnualReport(year);
+    printReport(`Moneta ${year} Annual Report`);
+  }
+
+  // Spending grouped by note/tag (e.g. "Banff trip"), biggest first
+  function notesSummary(rows) {
+    const tags = {};
+    rows.forEach(r => {
+      const note = String(r['Notes'] || '').trim();
+      const c = spendOf(r);
+      if (!note || !c) return;
+      const key = nameKey(note) || note.toLowerCase();
+      tags[key] = tags[key] || { name: note, c: 0, n: 0 };
+      tags[key].c += c;
+      tags[key].n++;
+    });
+    return Object.values(tags).filter(t => t.c > 0).sort((a, b) => b.c - a.c);
+  }
+
+  // ---- Monthly PDF report ----
+  function buildMonthlyReport(month) {
+    const rows = budgetData.filter(r => monthKeyOf(r) === month);
+    const prevKey = shiftMonth(month, -1);
+    const prevRows = budgetData.filter(r => monthKeyOf(r) === prevKey);
+    const cur = periodTotals(rows);
+    const prev = prevRows.length ? periodTotals(prevRows) : null;
+    const money = v => fmtMoney(v);
+    const moneyC = c => fmtMoney(c / 100);
+    const pct = (a, b) => (b ? `${((a / b) * 100).toFixed(1)}%` : '—');
+    const monthName = monthLabelOf(month, { month: 'long', year: 'numeric' });
+    const prevName = monthLabelOf(prevKey, { month: 'long' });
+    const change = (now, before, goodUp) => {
+      if (before === null || before === undefined || Math.abs(now - before) < 0.005) return '';
+      const up = now > before;
+      return `<em class="${up === goodUp ? 'inc' : 'exp'}">${up ? '▲' : '▼'} ${money(Math.abs(now - before))} vs ${escapeHtml(prevName)}</em>`;
+    };
+
+    // Category totals now and last month
+    const catNow = {};
+    const catPrev = {};
+    rows.forEach(r => { const c = spendOf(r); if (c) catNow[getCategory(r)] = (catNow[getCategory(r)] || 0) + c; });
+    prevRows.forEach(r => { const c = spendOf(r); if (c) catPrev[getCategory(r)] = (catPrev[getCategory(r)] || 0) + c; });
+    const cats = Object.entries(catNow).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]);
+    const spentC = Math.round(cur.spent * 100);
+
+    // Daily spending chart (light colours, whatever the app theme)
+    const [yy, mm] = month.split('-').map(Number);
+    const days = new Date(yy, mm, 0).getDate();
+    const perDay = new Array(days).fill(0);
+    rows.forEach(r => { const d = dayOf(r); if (d >= 1 && d <= days) perDay[d - 1] += spendOf(r); });
+    const tick = { color: REPORT_INK.muted, font: { size: 10 } };
+    const dailyImg = chartImage({
+      type: 'bar',
+      data: { labels: perDay.map((_, i) => i + 1), datasets: [{ data: perDay.map(c => Math.max(0, c) / 100), backgroundColor: REPORT_INK.expense, borderRadius: 2, maxBarThickness: 14 }] },
+      options: {
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { grid: { display: false }, ticks: { ...tick, maxRotation: 0, autoSkip: true, maxTicksLimit: 16 } },
+          y: { beginAtZero: true, grid: { color: REPORT_INK.grid }, border: { display: false }, ticks: { ...tick, callback: v => fmtMoneyShort(v) } }
+        }
+      }
+    }, 700, 200);
+    const topCats = cats.slice(0, 8);
+    const catImg = topCats.length ? chartImage({
+      type: 'bar',
+      data: { labels: topCats.map(([n]) => n), datasets: [{ data: topCats.map(([, v]) => v / 100), backgroundColor: topCats.map((_, i) => CHART_PALETTE.light[i] || '#64748B'), borderRadius: 3, maxBarThickness: 16 }] },
+      options: {
+        indexAxis: 'y',
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { beginAtZero: true, grid: { color: REPORT_INK.grid }, border: { display: false }, ticks: { ...tick, callback: v => fmtMoneyShort(v) } },
+          y: { grid: { display: false }, ticks: { ...tick, color: REPORT_INK.text } }
+        }
+      }
+    }, 700, topCats.length * 26 + 30) : '';
+
+    // People, stores, income, notes, budgets
+    const people = {};
+    rows.forEach(r => {
+      const c = classify(r);
+      if (!c.spend && !c.income) return;
+      const who = String(r['Purchased By'] || '').trim() || 'Unassigned';
+      people[who] = people[who] || { spent: 0, income: 0 };
+      people[who].spent += c.spend;
+      people[who].income += c.income;
+    });
+    const personRows = Object.entries(people).sort((a, b) => b[1].spent - a[1].spent);
+    const paid = Object.fromEntries(personRows.filter(([n, p]) => n !== 'Unassigned' && p.spent).map(([n, p]) => [n, p.spent]));
+    const transfers = settleUp(paid);
+    const stores = {};
+    const sources = {};
+    rows.forEach(r => {
+      const name = displayName(r['Purchased Store']) || '(no description)';
+      const key = nameKey(name) || name.toLowerCase();
+      const c = classify(r);
+      if (c.spend) { stores[key] = stores[key] || { name, c: 0, n: 0 }; stores[key].c += c.spend; stores[key].n++; }
+      if (c.income) { sources[key] = sources[key] || { name, c: 0 }; sources[key].c += c.income; }
+    });
+    const topStores = Object.values(stores).filter(x => x.c > 0).sort((a, b) => b.c - a.c).slice(0, 8);
+    const incomeSources = Object.values(sources).filter(x => x.c > 0).sort((a, b) => b.c - a.c);
+    const tags = notesSummary(rows);
+    const settings = getSettings();
+    const budgets = Object.entries(settings.budgets).map(([target, limit]) => {
+      const usedC = rows.reduce((c, r) => {
+        const cat = getCategory(r);
+        const hit = cat === target || getCategoryGroup(cat) === target || (r['Purchased Store'] || '').toLowerCase().includes(target.toLowerCase());
+        return hit ? c + spendOf(r) : c;
+      }, 0);
+      return { target, usedC, limitC: toCents(limit) };
+    });
+
+    const kpi = (label, value, cls, extra = '') => `<div class="rp-kpi"><span>${label}</span><strong class="${cls || ''}">${value}</strong>${extra}</div>`;
+    const sorted = rows.slice().sort((a, b) => String(a['Date']).localeCompare(String(b['Date'])));
+    const sourceText = source ? `Transactions on screen (opened from ${escapeHtml(source.name)})` : 'Transactions on screen';
+
+    document.getElementById('printReport').innerHTML = `
+      <div class="rp">
+        <header class="rp-head">
+          <div><div class="rp-brand">Moneta</div><h1>${escapeHtml(monthName)} Report</h1></div>
+          <div class="rp-meta">Generated ${escapeHtml(new Date().toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' }))}<br>${rows.length} transactions</div>
+        </header>
+        <p class="rp-source">Source: ${sourceText}</p>
+
+        <section class="rp-kpis">
+          ${kpi('Income', money(cur.income), 'inc', change(cur.income, prev && prev.income, true))}
+          ${kpi('Spent', money(cur.spent), 'exp', change(cur.spent, prev && prev.spent, false))}
+          ${kpi('Saved', money(cur.net), cur.net >= 0 ? 'inc' : 'exp', change(cur.net, prev && prev.net, true))}
+          ${kpi('Savings rate', cur.rate === null ? '—' : `${Math.round(cur.rate)}%`)}
+          ${kpi('Avg. per day', money(cur.spent / days))}
+        </section>
+
+        <section class="rp-block"><h2>Spending by day</h2><img src="${dailyImg}" alt="Spending each day of ${escapeHtml(monthName)}"></section>
+        ${catImg ? `<section class="rp-block"><h2>Where the money went</h2><img src="${catImg}" alt="Spending by category"></section>` : ''}
+
+        <section class="rp-block rp-two">
+          <div>
+            <h2>Categories</h2>
+            <table class="rp-table">
+              <thead><tr><th>Category</th><th>Spent</th><th>Share</th><th>vs ${escapeHtml(prevName)}</th></tr></thead>
+              <tbody>${cats.map(([n, v]) => {
+                const before = catPrev[n] || 0;
+                const diff = v - before;
+                const cmp = !prev ? '—' : !before ? 'new' : `${diff > 0 ? '▲' : diff < 0 ? '▼' : ''} ${moneyC(Math.abs(diff))}`;
+                return `<tr><td>${escapeHtml(n)}</td><td>${moneyC(v)}</td><td>${pct(v, spentC)}</td><td class="${diff > 0 ? 'exp' : 'inc'}">${cmp}</td></tr>`;
+              }).join('') || '<tr><td colspan="4">No spending</td></tr>'}</tbody>
+            </table>
+            ${budgets.length ? `
+            <h2>Budgets</h2>
+            <table class="rp-table">
+              <thead><tr><th>Budget</th><th>Spent</th><th>Limit</th><th>Status</th></tr></thead>
+              <tbody>${budgets.map(b => `<tr><td>${escapeHtml(b.target)}</td><td>${moneyC(b.usedC)}</td><td>${moneyC(b.limitC)}</td>` +
+                `<td class="${b.usedC > b.limitC ? 'exp' : 'inc'}">${b.usedC > b.limitC ? `Over by ${moneyC(b.usedC - b.limitC)}` : `${moneyC(b.limitC - b.usedC)} left`}</td></tr>`).join('')}</tbody>
+            </table>` : ''}
+          </div>
+          <div>
+            <h2>Top stores</h2>
+            <table class="rp-table">
+              <thead><tr><th>Store</th><th>Spent</th><th>Visits</th></tr></thead>
+              <tbody>${topStores.map(x => `<tr><td>${escapeHtml(x.name)}</td><td>${moneyC(x.c)}</td><td>${x.n}</td></tr>`).join('') || '<tr><td colspan="3">—</td></tr>'}</tbody>
+            </table>
+            ${incomeSources.length ? `
+            <h2>Income</h2>
+            <table class="rp-table">
+              <thead><tr><th>Source</th><th>Amount</th></tr></thead>
+              <tbody>${incomeSources.map(x => `<tr><td>${escapeHtml(x.name)}</td><td class="inc">${moneyC(x.c)}</td></tr>`).join('')}</tbody>
+            </table>` : ''}
+          </div>
+        </section>
+
+        ${personRows.length ? `
+        <section class="rp-block">
+          <h2>People</h2>
+          <table class="rp-table">
+            <thead><tr><th>Person</th><th>Spent</th><th>Share of spending</th><th>Income</th></tr></thead>
+            <tbody>${personRows.map(([n, p]) => `<tr><td><strong>${escapeHtml(n)}</strong></td><td class="exp">${moneyC(p.spent)}</td><td>${pct(p.spent, spentC)}</td><td class="inc">${p.income ? moneyC(p.income) : '–'}</td></tr>`).join('')}</tbody>
+          </table>
+          ${transfers.length ? `<p class="rp-note">To share spending equally: ${transfers.map(t => `${escapeHtml(t.from)} pays ${escapeHtml(t.to)} ${moneyC(t.cents)}`).join('; ')}.</p>` : ''}
+        </section>` : ''}
+
+        ${tags.length ? `
+        <section class="rp-block">
+          <h2>Notes &amp; tags</h2>
+          <table class="rp-table">
+            <thead><tr><th>Note / tag</th><th>Spent</th><th>Transactions</th></tr></thead>
+            <tbody>${tags.map(t => `<tr><td>${escapeHtml(t.name)}</td><td>${moneyC(t.c)}</td><td>${t.n}</td></tr>`).join('')}</tbody>
+          </table>
+        </section>` : ''}
+
+        <section class="rp-block rp-break">
+          <h2>All transactions</h2>
+          <table class="rp-table rp-list">
+            <thead><tr><th>Date</th><th>Description</th><th>Category</th><th>Person</th><th>Bank</th><th>Note</th><th>Amount</th></tr></thead>
+            <tbody>${sorted.map(r => {
+              const c = classify(r);
+              const net = toCents(r['Credit [C]']) - toCents(r['Debit [D]']);
+              const cls = c.kind === 'transfer' ? '' : net > 0 ? 'inc' : 'exp';
+              return `<tr><td>${escapeHtml(shortDate(r['Date']))}</td><td>${escapeHtml(r['Purchased Store'] || '—')}${c.kind === 'transfer' ? ' <span class="rp-tag">transfer</span>' : c.kind === 'refund' ? ' <span class="rp-tag">refund</span>' : ''}</td>` +
+                `<td>${escapeHtml(getCategory(r))}</td><td>${escapeHtml(r['Purchased By'] || '')}</td><td>${escapeHtml(r['Bank Name'] || '')}</td><td>${escapeHtml(r['Notes'] || '')}</td>` +
+                `<td class="${cls}">${net > 0 ? '+' : net < 0 ? '−' : ''}${moneyC(Math.abs(net))}</td></tr>`;
+            }).join('')}</tbody>
+          </table>
+          <p class="rp-note">Refunds are subtracted from their category. Credit card payments, transfers between your accounts and investing are listed but not counted as spending or income.</p>
+        </section>
+      </div>`;
+  }
+
+  // The month shown in the overview (or the newest month when "All time" is selected)
+  function reportMonth() {
+    return dashActive !== 'all' ? dashActive : (dataMonths()[0] || null);
+  }
+
+  function downloadMonthPdf() {
+    const month = reportMonth();
+    if (!month) {
+      showStatus('⚠️ Add or open transactions first — the report needs a month with data.', true);
+      return;
+    }
+    buildMonthlyReport(month);
+    printReport(`Moneta ${monthLabelOf(month, { month: 'long', year: 'numeric' })} Report`);
+  }
+
+  document.getElementById('showYearSummary').addEventListener('click', openYearSummary);
+  document.getElementById('yearPdf').addEventListener('click', downloadYearPdf);
+  document.getElementById('yearFilesInput').addEventListener('change', (e) => {
+    const files = [...(e.target.files || [])];
+    e.target.value = '';
+    loadYearFiles(files);
+  });
+  document.getElementById('yearUseScreen').addEventListener('click', () => {
+    yearRows = null;
+    yearFileNames = [];
+    fillYearSelect();
+    updateYearSource();
+    renderYearSummary();
+  });
+  document.getElementById('yearSelect').addEventListener('change', renderYearSummary);
+  document.getElementById('yearExport').addEventListener('click', exportYearSummary);
+  document.getElementById('closeYear').addEventListener('click', () => { document.getElementById('yearModal').style.display = 'none'; });
+  document.getElementById('yearModal').addEventListener('click', (e) => {
+    if (e.target.id === 'yearModal') e.target.style.display = 'none';
+  });
   
   // Add event listeners for close buttons
   closeIncomeExpense.addEventListener('click', () => {
@@ -953,16 +1871,18 @@
     };
     const category = document.getElementById(f.category).value;
     if (category) entry['Category'] = category;
+    const note = document.getElementById(f.notes).value.replace(/\s+/g, ' ').trim().slice(0, 200);
+    if (note) entry['Notes'] = note;
     return entry;
   }
 
   const ADD_FORM = {
     date: 'date', amount: 'amount', type: 'type', person: 'purchasedBy', store: 'store',
-    bank: 'bank', category: 'category', dateError: 'dateError', amountError: 'amountError'
+    bank: 'bank', category: 'category', notes: 'notes', dateError: 'dateError', amountError: 'amountError'
   };
   const EDIT_FORM = {
     date: 'editDate', amount: 'editAmount', type: 'editType', person: 'editPerson', store: 'editStore',
-    bank: 'editBank', category: 'editCategory', dateError: 'editDateError', amountError: 'editAmountError'
+    bank: 'editBank', category: 'editCategory', notes: 'editNotes', dateError: 'editDateError', amountError: 'editAmountError'
   };
 
   function confirmIfDuplicate(entry, skipIndex) {
@@ -1018,6 +1938,7 @@
   function resetForm() {
     document.getElementById('amount').value = '';
     document.getElementById('store').value = '';
+    document.getElementById('notes').value = '';
     document.getElementById('category').value = '';
     document.getElementById('date').value = todayStr();
     document.getElementById('storeHint').textContent = '';
@@ -1057,6 +1978,7 @@
   }
 
   function openEntrySheet() {
+    document.getElementById('entryCard').classList.remove('collapsed');
     document.getElementById('entryCard').classList.add('sheet-open');
     document.getElementById('sheetBackdrop').hidden = false;
     document.body.classList.add('sheet-locked');
@@ -1067,6 +1989,113 @@
     document.getElementById('entryCard').classList.remove('sheet-open');
     document.getElementById('sheetBackdrop').hidden = true;
     document.body.classList.remove('sheet-locked');
+  }
+
+  // ---- Merged names (reports group "Home rent" with "House rent", etc.) ----
+  // Your data is never rewritten; this only changes how names are grouped and shown.
+  let aliasCache = null;
+  function displayName(name) {
+    const clean = String(name || '').trim();
+    if (!aliasCache) aliasCache = getSettings().aliases;
+    return aliasCache[nameKey(clean)] || clean;
+  }
+
+  const groupKeyOf = name => nameKey(displayName(name));
+
+  // Distinct names in rows after merging, most used first
+  function distinctNames(rows) {
+    const map = new Map();
+    rows.forEach(r => {
+      const raw = String(r['Purchased Store'] || '').trim();
+      if (!raw) return;
+      const key = groupKeyOf(raw);
+      if (!key) return;
+      const cur = map.get(key) || { key, name: displayName(raw), count: 0 };
+      cur.count++;
+      map.set(key, cur);
+    });
+    return [...map.values()].sort((a, b) => b.count - a.count);
+  }
+
+  function mergeNames(fromName, toName) {
+    const settings = getSettings();
+    const toKey = nameKey(toName);
+    settings.aliases[nameKey(fromName)] = toName;
+    // Anything already merged into the old name follows it
+    Object.keys(settings.aliases).forEach(k => {
+      if (nameKey(settings.aliases[k]) === nameKey(fromName)) settings.aliases[k] = toName;
+    });
+    delete settings.aliases[toKey]; // the kept name shows as itself
+    saveSettings(settings);
+    afterNamesChanged(`🔗 "${fromName}" now counts as "${toName}"`);
+  }
+
+  function markNotSame(id) {
+    const settings = getSettings();
+    if (!settings.notSame.includes(id)) settings.notSame.push(id);
+    saveSettings(settings);
+    afterNamesChanged('👍 Kept separate');
+  }
+
+  function removeAlias(key) {
+    const settings = getSettings();
+    delete settings.aliases[key];
+    saveSettings(settings);
+    afterNamesChanged('↩️ Names unmerged');
+  }
+
+  function afterNamesChanged(message) {
+    renderTable();
+    if (document.getElementById('yearModal').style.display === 'flex') renderYearSummary();
+    if (document.getElementById('settingsModal').style.display === 'flex') populateSettingsUI();
+    showStatus(message);
+  }
+
+  // Suggestions panel (used in Year summary)
+  let nameSuggestions = [];
+  function renderNameSuggestions(rows, hostId) {
+    const host = document.getElementById(hostId);
+    const settings = getSettings();
+    nameSuggestions = findSimilarNames(distinctNames(rows), new Set(settings.notSame));
+    host.hidden = !nameSuggestions.length;
+    if (!nameSuggestions.length) return;
+    host.innerHTML = `<div class="names-title"><i class="fas fa-link" aria-hidden="true"></i> These look like the same thing — merge them?</div>` +
+      nameSuggestions.map((p, i) =>
+        `<div class="names-row"><span class="names-pair"><strong>${escapeHtml(p.a.name)}</strong> <em>(${p.a.count})</em> · <strong>${escapeHtml(p.b.name)}</strong> <em>(${p.b.count})</em></span>` +
+        `<span class="names-actions">` +
+        `<button type="button" class="pill-btn ghost" data-action="mergeSuggestion" data-index="${i}" data-keep="a">Use “${escapeHtml(p.a.name)}”</button>` +
+        `<button type="button" class="pill-btn ghost" data-action="mergeSuggestion" data-index="${i}" data-keep="b">Use “${escapeHtml(p.b.name)}”</button>` +
+        `<button type="button" class="pill-btn ghost" data-action="notSameSuggestion" data-index="${i}">Not the same</button>` +
+        `</span></div>`).join('');
+  }
+
+  // Notes you've used before, newest first, offered while typing a note
+  function refreshNoteSuggestions() {
+    const seen = new Set();
+    const notes = [];
+    for (let i = budgetData.length - 1; i >= 0 && notes.length < 50; i--) {
+      const n = budgetData[i]['Notes'];
+      if (n && !seen.has(n.toLowerCase())) { seen.add(n.toLowerCase()); notes.push(n); }
+    }
+    document.getElementById('noteSuggestions').innerHTML = notes.map(n => `<option value="${escapeHtml(n)}"></option>`).join('');
+  }
+
+  // Tag the selected rows with one note (empty removes notes)
+  function bulkSetNote() {
+    const note = document.getElementById('bulkNote').value.replace(/\s+/g, ' ').trim().slice(0, 200);
+    const rows = [...selectedRows];
+    if (!rows.length) return;
+    const before = rows.map(r => r['Notes']);
+    rows.forEach(r => { if (note) r['Notes'] = note; else delete r['Notes']; });
+    markChanged(rows.length);
+    document.getElementById('bulkNote').value = '';
+    renderTable();
+    showStatus(note ? `🏷️ Tagged ${rows.length} with “${note}”` : `🏷️ Removed notes from ${rows.length}`, false, () => {
+      rows.forEach((r, i) => { if (before[i] === undefined) delete r['Notes']; else r['Notes'] = before[i]; });
+      markChanged();
+      renderTable();
+      showStatus('↩️ Notes restored.');
+    });
   }
 
   // ---- Store memory & autocomplete ----
@@ -1105,7 +2134,7 @@
         used: Date.now(),
         person: r['Purchased By'] || '',
         bank: r['Bank Name'] || '',
-        category: r['Category'] || '',
+        category: r['Category'] || (prev ? prev.category : '') || '',
         type: toCents(r['Credit [C]']) > toCents(r['Debit [D]']) ? 'C' : 'D'
       };
       changed = true;
@@ -1116,6 +2145,24 @@
       keys.sort((a, b) => (mem[a].used || 0) - (mem[b].used || 0))
         .slice(0, keys.length - STORE_LIMIT).forEach(k => delete mem[k]);
     }
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(mem)); } catch (e) { /* storage full */ }
+  }
+
+  function learnedCategory(store) {
+    const key = String(store || '').trim().toLowerCase();
+    if (!key) return '';
+    const m = loadStoreMemory()[key];
+    if (!m || !m.category) return '';
+    const cat = canonicalCategory(m.category);
+    return getCategoryGroup(cat) ? cat : '';
+  }
+
+  function forgetLearnedCategory(rows) {
+    const mem = loadStoreMemory();
+    rows.forEach(r => {
+      const m = mem[String(r['Purchased Store'] || '').trim().toLowerCase()];
+      if (m) m.category = '';
+    });
     try { localStorage.setItem(STORE_KEY, JSON.stringify(mem)); } catch (e) { /* storage full */ }
   }
 
@@ -1320,6 +2367,8 @@
     document.getElementById('categoryPickerPanel').innerHTML = panelHTML;
     document.getElementById('editCategoryPanel').innerHTML = panelHTML;
     document.getElementById('editCategory').innerHTML = sel.innerHTML;
+    document.getElementById('splitCategory').innerHTML =
+      '<option value="">Choose category…</option>' + sel.innerHTML.replace('<option value="">Auto-detect</option>', '');
     document.getElementById('bulkCategory').innerHTML =
       '<option value="">Choose category…</option><option value="__auto">Auto-detect</option>' +
       sel.innerHTML.replace('<option value="">Auto-detect</option>', '');
@@ -1348,7 +2397,7 @@
     const hint = document.getElementById('categoryHint');
     const manual = document.getElementById('category').value;
     const store = document.getElementById('store').value.trim();
-    hint.textContent = (!manual && store) ? `→ ${categorizeStore(store)}` : '';
+    hint.textContent = (!manual && store) ? `→ ${getCategory({ 'Purchased Store': store })}` : '';
     document.getElementById('categoryPickerLabel').textContent = manual || 'Auto-detect';
   }
 
@@ -1408,12 +2457,25 @@
     return result;
   }
 
-  // Manual category on the entry wins; otherwise guess from keywords
+  // Manual category on the entry wins; then what you chose for this store
+  // before (learned from your corrections); then keyword matching
   function getCategory(row) {
-    return row['Category'] || categorizeStore(row['Purchased Store'] || '');
+    return (row['Category'] && canonicalCategory(row['Category'])) || learnedCategory(row['Purchased Store']) || categorizeStore(row['Purchased Store'] || '');
   }
 
-  function getCategoryBadge(category) {
+  const CATEGORY_ICONS = {
+    'Income': 'sack-dollar', 'Rent': 'house', 'Home': 'couch', 'Phone & Internet': 'wifi', 'Utilities': 'bolt',
+    'Subscriptions': 'repeat', 'Bills': 'file-invoice-dollar', 'Groceries': 'cart-shopping', 'Dining': 'utensils',
+    'Gas': 'gas-pump', 'Transit': 'bus', 'Flight': 'plane', 'Travel': 'suitcase-rolling', 'Health': 'kit-medical',
+    'Fitness': 'dumbbell', 'SPA': 'spa', 'Loans': 'landmark', 'Insurance': 'shield-heart', 'Taxes & Fees': 'receipt',
+    'Software': 'laptop-code', 'Education': 'graduation-cap', 'India': 'paper-plane', 'Kids': 'baby', 'Pets': 'paw',
+    'Gifts & Donations': 'gift', 'Movie': 'film', 'Electronics': 'tv', 'Shopping': 'bag-shopping',
+    'Credit Card Payment': 'credit-card', 'Transfer': 'right-left', 'Investment': 'chart-line'
+  };
+
+  function getCategoryBadge(displayName) {
+    getCategoryGroups();
+    const category = categoryCache.originals[displayName] || displayName; // built-in identity
     const classMap = {
       'Groceries': 'category-groceries',
       'Bills': 'category-bills',
@@ -1435,13 +2497,14 @@
       'Shopping': 'category-shopping',
       'Other': 'category-other'
     };
+    const icon = `<i class="fas fa-${CATEGORY_ICONS[category] || 'tag'}" aria-hidden="true"></i>`;
     if (classMap[category]) {
-      return `<span class="category-badge ${classMap[category]}">${escapeHtml(category)}</span>`;
+      return `<span class="category-badge ${classMap[category]}">${icon}${escapeHtml(displayName)}</span>`;
     }
     // Custom categories get a stable auto-generated color from their name
     let hue = 0;
     for (const ch of category) hue = (hue * 31 + ch.charCodeAt(0)) % 360;
-    return `<span class="category-badge" style="background-color: hsl(${hue} 70% 88%); color: hsl(${hue} 60% 28%);">${escapeHtml(category)}</span>`;
+    return `<span class="category-badge" style="background-color: hsl(${hue} 70% 88%); color: hsl(${hue} 60% 28%);">${icon}${escapeHtml(displayName)}</span>`;
   }
 
   function sortData(column) {
@@ -1498,8 +2561,13 @@
     renderTable();
   }
 
+  let categoryFilter = ''; // set by clicking a category on the dashboard
+
   function getFilteredData() {
-    const searchTerm = searchInput.value.toLowerCase();
+    const searchTerm = searchInput.value.trim().toLowerCase();
+    // "85.20" or "$85" also finds that amount
+    const amountMatch = searchTerm.match(/^\$?(\d+(?:\.\d{1,2})?)$/);
+    const searchCents = amountMatch ? toCents(amountMatch[1]) : null;
     const start = filterStartDate.value;
     const end = filterEndDate.value;
     const minAmount = parseFloat(filterMinAmount.value) || 0;
@@ -1510,8 +2578,12 @@
         (row['Purchased By'] || '').toLowerCase().includes(searchTerm) ||
         (row['Purchased Store'] || '').toLowerCase().includes(searchTerm) ||
         (row['Bank Name'] || '').toLowerCase().includes(searchTerm) ||
-        getCategory(row).toLowerCase().includes(searchTerm)
+        getCategory(row).toLowerCase().includes(searchTerm) ||
+        (row['Notes'] || '').toLowerCase().includes(searchTerm) ||
+        (searchCents !== null && [row['Amount Total'], row['Debit [D]'], row['Credit [C]']].some(v => v !== '' && toCents(v) === searchCents))
       );
+      const cat = categoryFilter ? getCategory(row) : '';
+      const matchesCategory = !categoryFilter || cat === categoryFilter || getCategoryGroup(cat) === categoryFilter;
 
       const rowDate = row['Date'] || '';
       const matchesDate = (!start || rowDate >= start) && (!end || rowDate <= end);
@@ -1519,7 +2591,7 @@
       const rowAmount = Number(row['Amount Total']) || 0;
       const matchesAmount = rowAmount >= minAmount && rowAmount <= maxAmount;
 
-      return matchesSearch && matchesDate && matchesAmount;
+      return matchesSearch && matchesDate && matchesAmount && matchesCategory;
     });
   }
 
@@ -1545,6 +2617,11 @@
     return new Date(y, m - 1, d).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
   }
 
+  // Large files: draw the first rows and add more on request (totals always use every row)
+  const TABLE_PAGE = 300;
+  let tableLimit = TABLE_PAGE;
+  let tableViewKey = '';
+
   function renderTable() {
     const table = document.getElementById('budgetTable');
     const tbody = table.querySelector('tbody');
@@ -1552,7 +2629,10 @@
 
     const filteredData = getFilteredData();
     const filtersActive = searchInput.value !== '' || filterStartDate.value || filterEndDate.value ||
-      filterMinAmount.value !== '' || filterMaxAmount.value !== '';
+      filterMinAmount.value !== '' || filterMaxAmount.value !== '' || !!categoryFilter;
+    const chip = document.getElementById('categoryChip');
+    chip.hidden = !categoryFilter;
+    document.getElementById('categoryChipLabel').textContent = categoryFilter;
 
     document.getElementById('rowCount').textContent =
       filtersActive ? `(${filteredData.length} of ${budgetData.length})` : `(${budgetData.length})`;
@@ -1561,6 +2641,7 @@
     const live = new Set(budgetData);
     [...selectedRows].forEach(r => { if (!live.has(r)) selectedRows.delete(r); });
     updateBulkBar(filteredData);
+    refreshNoteSuggestions();
 
     if (filteredData.length === 0) {
       table.classList.remove('grouped');
@@ -1592,12 +2673,23 @@
       dayTotals[r['Date'] || ''] = (dayTotals[r['Date'] || ''] || 0) + c.income - c.spend;
     });
 
+    // A new search, filter, sort or file starts again from the top
+    const viewKey = [searchInput.value, filterStartDate.value, filterEndDate.value, filterMinAmount.value,
+      filterMaxAmount.value, categoryFilter, currentSort.column, currentSort.direction, source && source.name].join('|');
+    if (viewKey !== tableViewKey) { tableViewKey = viewKey; tableLimit = TABLE_PAGE; }
+
     let html = '';
     let lastDay = null;
     let spentC = 0;
     let incomeC = 0;
     let transferC = 0;
-    rows.forEach(row => {
+    rows.forEach(r => {
+      const c = classify(r);
+      spentC += c.spend;
+      incomeC += c.income;
+      transferC += Math.abs(c.transfer);
+    });
+    rows.slice(0, tableLimit).forEach(row => {
       const idx = indexOf.get(row);
       const day = row['Date'] || '';
       if (grouped && day !== lastDay) {
@@ -1607,9 +2699,6 @@
           `<span class="day-total ${total > 0 ? 'is-income' : ''}">${fmtSigned(total)}</span></div></td></tr>`;
       }
       const c = classify(row);
-      spentC += c.spend;
-      incomeC += c.income;
-      transferC += Math.abs(c.transfer);
       const net = toCents(row['Credit [C]']) - toCents(row['Debit [D]']);
       const amountClass = c.kind === 'transfer' ? 'is-transfer' : net > 0 ? 'is-income' : 'is-expense';
       const kindTag = c.kind === 'transfer' ? '<span class="kind-tag">Transfer · not counted</span>'
@@ -1622,7 +2711,9 @@
         `<td class="sel-col"><input type="checkbox" class="row-check" data-index="${idx}"${checked ? ' checked' : ''} aria-label="Select ${escapeHtml(store || 'transaction')}"></td>` +
         `<td class="col-date">${escapeHtml(shortDate(day))}</td>` +
         `<td class="col-txn"><div class="txn-store">${escapeHtml(store || '—')}</div>` +
-        `<div class="txn-sub">${getCategoryBadge(getCategory(row))}${kindTag}<span class="txn-meta">${escapeHtml(meta)}</span></div></td>` +
+        `<div class="txn-sub">${getCategoryBadge(getCategory(row))}${kindTag}` +
+        (row['Notes'] ? `<button type="button" class="note-chip" data-note="${escapeHtml(row['Notes'])}" title=""><i class="fas fa-hashtag" aria-hidden="true"></i>${escapeHtml(row['Notes'])}</button>` : '') +
+        `<span class="txn-meta">${escapeHtml(meta)}</span></div></td>` +
         `<td class="col-person">${escapeHtml(row['Purchased By'] || '')}</td>` +
         `<td class="col-bank">${escapeHtml(row['Bank Name'] || '')}</td>` +
         `<td class="right amount-cell ${amountClass}">${fmtSigned(net)}</td>` +
@@ -1631,6 +2722,11 @@
         `<button type="button" class="icon-btn danger" data-action="removeRow" data-index="${idx}" aria-label="Delete ${escapeHtml(store || 'transaction')}"><i class="fas fa-trash"></i></button>` +
         `</td></tr>`;
     });
+    const remaining = rows.length - Math.min(tableLimit, rows.length);
+    if (remaining > 0) {
+      html += `<tr class="more-row"><td colspan="7"><button type="button" class="pill-btn ghost" data-action="showMoreRows">` +
+        `<i class="fas fa-angles-down" aria-hidden="true"></i> Show ${Math.min(TABLE_PAGE, remaining)} more <span>(${remaining.toLocaleString()} not shown)</span></button></td></tr>`;
+    }
     tbody.innerHTML = html;
 
     const n = filteredData.length;
@@ -1680,7 +2776,7 @@
         return matches ? cents + spendOf(r) : cents;
       }, 0);
       const limitC = toCents(limit);
-      const projectedC = isCurrent ? forecastMonth(spentC, elapsed, daysInMonth) : null;
+      const projectedC = isCurrent && elapsed >= FORECAST_MIN_DAYS ? forecastMonth(spentC, elapsed, daysInMonth) : null;
       const status = budgetStatus(spentC, limitC, projectedC);
       const percent = limitC > 0 ? Math.max(0, Math.min((spentC / limitC) * 100, 100)) : 0;
       const left = limitC - spentC;
@@ -1692,6 +2788,10 @@
 
       const item = document.createElement('div');
       item.className = `budget-item budget-${status}`;
+      item.dataset.target = target;
+      item.setAttribute('role', 'button');
+      item.tabIndex = 0;
+      item.setAttribute('aria-label', `${target}: ${statusText}. Show transactions`);
       item.innerHTML = `
         <div class="budget-row">
           <span class="budget-name">${escapeHtml(target)}</span>
@@ -1730,6 +2830,7 @@
     document.getElementById('editAmount').value = (Math.abs(credit - debit) / 100).toFixed(2);
     document.getElementById('editDate').value = /^\d{4}-\d{2}-\d{2}$/.test(row['Date']) ? row['Date'] : '';
     document.getElementById('editStore').value = row['Purchased Store'] || '';
+    document.getElementById('editNotes').value = row['Notes'] || '';
 
     const cat = row['Category'] || '';
     const catSel = document.getElementById('editCategory');
@@ -1737,10 +2838,11 @@
       catSel.insertAdjacentHTML('beforeend', `<option value="${escapeHtml(cat)}">${escapeHtml(cat)}</option>`);
     }
     catSel.value = cat;
-    document.getElementById('editCategoryLabel').textContent = cat || `Auto-detect (${categorizeStore(row['Purchased Store'] || '')})`;
+    document.getElementById('editCategoryLabel').textContent = cat || `Auto-detect (${getCategory({ 'Purchased Store': row['Purchased Store'] })})`;
 
     setFieldError('editAmountError', '');
     setFieldError('editDateError', '');
+    toggleSplit(false);
     syncDateChips();
     document.getElementById('editModal').style.display = 'flex';
     setTimeout(() => document.getElementById('editAmount').focus(), 50);
@@ -1759,6 +2861,7 @@
     const before = budgetData[editIndex];
     const at = editIndex;
     budgetData[at] = entry;
+    if (!entry['Category'] && before['Category']) forgetLearnedCategory([entry]);
     rememberStores([entry]);
     if (selectedRows.delete(before)) selectedRows.add(entry);
     markChanged();
@@ -1772,6 +2875,55 @@
       markChanged();
       renderTable();
       showStatus('↩️ Edit undone.');
+    });
+  }
+
+  function toggleSplit(open) {
+    document.getElementById('splitBox').hidden = !open;
+    document.getElementById('editSplit').setAttribute('aria-expanded', String(open));
+    document.getElementById('splitAmount').value = '';
+    document.getElementById('splitCategory').value = '';
+    setFieldError('splitError', '');
+    if (open) setTimeout(() => document.getElementById('splitAmount').focus(), 30);
+  }
+
+  // Moves part of the amount into a new row with its own category
+  // (e.g. $40 of a $160 Costco receipt to Home). Totals stay exactly the same.
+  function splitFromEditor() {
+    if (editIndex < 0) return;
+    const entry = readEntryForm(EDIT_FORM);
+    if (!entry) return;
+    const totalC = toCents(entry['Amount Total']);
+    const partC = toCents(document.getElementById('splitAmount').value);
+    const category = document.getElementById('splitCategory').value;
+    if (!(partC > 0 && partC < totalC)) {
+      setFieldError('splitError', `Enter an amount between ${fmtMoney(0.01)} and ${fmtMoney((totalC - 1) / 100)}`);
+      return;
+    }
+    if (!category) {
+      setFieldError('splitError', 'Choose a category for the split part');
+      return;
+    }
+    const isCredit = entry['Credit [C]'] !== '';
+    const withAmount = (base, cents) => {
+      const v = cents / 100;
+      return { ...base, 'Debit [D]': isCredit ? '' : v, 'Credit [C]': isCredit ? v : '', 'Amount Total': v };
+    };
+    const kept = withAmount(entry, totalC - partC);
+    const part = withAmount(entry, partC);
+    part['Category'] = category;
+    const at = editIndex;
+    const before = budgetData[at];
+    budgetData.splice(at, 1, kept, part);
+    markChanged(2);
+    closeEditor();
+    renderTable();
+    showStatus(`✂️ Split into ${fmtMoney(kept['Amount Total'])} + ${fmtMoney(part['Amount Total'])} ${category}`, false, () => {
+      const i = budgetData.indexOf(kept);
+      if (i > -1 && budgetData[i + 1] === part) budgetData.splice(i, 2, before);
+      markChanged();
+      renderTable();
+      showStatus('↩️ Split undone.');
     });
   }
 
@@ -1828,6 +2980,8 @@
       if (value === '__auto') delete r['Category'];
       else r['Category'] = value;
     });
+    if (value === '__auto') forgetLearnedCategory(rows);
+    else rememberStores(rows);
     markChanged(rows.length);
     renderTable();
     showStatus(`🏷️ Updated ${rows.length} transaction${rows.length === 1 ? '' : 's'}.`, false, () => {
@@ -1883,7 +3037,7 @@
           savedAt: Date.now(),
           unsaved: unsavedCount,
           rows: budgetData,
-          source: source ? { name: source.name, months: source.months } : null
+          source: source ? { name: source.name, months: source.months, sheets: source.sheets || null } : null
         }));
       } else {
         localStorage.removeItem(DRAFT_KEY);
@@ -1914,6 +3068,12 @@
     document.getElementById('draftText').textContent =
       `You have ${changes} unsaved change${changes === 1 ? '' : 's'} from ${when} (${draft.rows.length} transactions).`;
     document.getElementById('draftBanner').hidden = false;
+    // Show the restore bar: the browser may put the old scroll position back
+    // after loading, so scroll to the top once loading has finished
+    if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
+    const toTop = () => setTimeout(() => window.scrollTo({ top: 0 }), 0);
+    if (document.readyState === 'complete') toTop();
+    else window.addEventListener('load', toTop, { once: true });
   }
 
   async function restoreDraft() {
@@ -1928,6 +3088,10 @@
       source = {
         name: draft.source.name,
         months: draft.source.months.filter(m => /^\d{4}-\d{2}$/.test(m)),
+        sheets: Array.isArray(draft.source.sheets)
+          ? draft.source.sheets.filter(sh => sh && typeof sh.name === 'string' && Array.isArray(sh.months))
+            .map(sh => ({ name: sh.name, months: sh.months.filter(m => /^\d{4}-\d{2}$/.test(m)) }))
+          : null,
         handle: handle && handle.name === draft.source.name ? handle : null,
         workbook: null
       };
@@ -2000,7 +3164,7 @@
   }
 
   // ---- Saving to Excel ----
-  const EXPORT_COLUMNS = ['Date', 'Purchased By', 'Purchased Store', 'Bank Name', 'Category', 'Debit [D]', 'Credit [C]', 'Amount Total'];
+  const EXPORT_COLUMNS = ['Date', 'Purchased By', 'Purchased Store', 'Bank Name', 'Category', 'Debit [D]', 'Credit [C]', 'Amount Total', 'Notes'];
 
   function buildSheet(rows) {
     const clean = rows.map(r => Object.fromEntries(EXPORT_COLUMNS.map(c => [c, r[c] ?? ''])));
@@ -2010,11 +3174,28 @@
     return ws;
   }
 
-  // Puts the sheet first in the workbook, keeping any other sheets the user added
-  function withDataSheet(workbook, ws) {
+  // Puts the data into the named sheet (or the first one), keeping any other
+  // sheets the user added
+  function withDataSheet(workbook, ws, sheetName) {
     const wb = workbook || XLSX.utils.book_new();
-    if (wb.SheetNames.length) wb.Sheets[wb.SheetNames[0]] = ws;
-    else XLSX.utils.book_append_sheet(wb, ws, 'Budget Data');
+    if (sheetName && wb.Sheets[sheetName]) wb.Sheets[sheetName] = ws;
+    else if (!sheetName && wb.SheetNames.length) wb.Sheets[wb.SheetNames[0]] = ws;
+    else XLSX.utils.book_append_sheet(wb, ws, sheetName || 'Budget Data');
+    return wb;
+  }
+
+  // The opened workbook with its data sheets rewritten. A workbook with a sheet
+  // per month gets each month back on its own sheet (rows without a date, or
+  // moved to a month no sheet had, go to the first data sheet).
+  function sourceWorkbookWith(rows) {
+    const wb = source.workbook || XLSX.utils.book_new();
+    const sheets = source.sheets && source.sheets.length ? source.sheets : null;
+    if (!sheets || sheets.length === 1) return withDataSheet(wb, buildSheet(rows), sheets ? sheets[0].name : null);
+    const sheetOf = {};
+    sheets.forEach(sh => sh.months.forEach(m => { if (!sheetOf[m]) sheetOf[m] = sh.name; }));
+    const buckets = Object.fromEntries(sheets.map(sh => [sh.name, []]));
+    rows.forEach(r => buckets[sheetOf[monthKeyOf(r)] || sheets[0].name].push(r));
+    sheets.forEach(sh => withDataSheet(wb, buildSheet(buckets[sh.name]), sh.name));
     return wb;
   }
 
@@ -2036,18 +3217,17 @@
       const groups = groupForSave(budgetData, source ? source.months : null, todayStr().slice(0, 7));
       const done = [];
       for (const [key, rows] of groups) {
-        const ws = buildSheet(rows);
         if (key === 'source') {
-          if (source.handle && await saveToSourceFile(ws)) {
+          if (source.handle && await saveToSourceFile(rows)) {
             done.push(`updated ${source.name}`);
             continue;
           }
           const name = source.name.replace(/\.[^.]*$/, '') + '.xlsx';
-          XLSX.writeFile(withDataSheet(source.workbook, ws), name);
+          XLSX.writeFile(sourceWorkbookWith(rows), name);
           done.push(`downloaded ${name}`);
         } else {
           const name = monthFileName(key);
-          XLSX.writeFile(withDataSheet(null, ws), name);
+          XLSX.writeFile(withDataSheet(null, buildSheet(rows)), name);
           done.push(`downloaded ${name}`);
         }
       }
@@ -2060,7 +3240,7 @@
 
   // Writes into the file that was opened (Chrome/Edge). Returns false if the
   // user declines access, so the caller falls back to a download.
-  async function saveToSourceFile(ws) {
+  async function saveToSourceFile(rows) {
     const { handle } = source;
     const opts = { mode: 'readwrite' };
     if ((await handle.queryPermission(opts)) !== 'granted' &&
@@ -2072,31 +3252,59 @@
       source.workbook = XLSX.read(new Uint8Array(await (await handle.getFile()).arrayBuffer()), { type: 'array' });
     }
     const writable = await handle.createWritable();
-    await writable.write(XLSX.write(withDataSheet(source.workbook, ws), { bookType: 'xlsx', type: 'array' }));
+    await writable.write(XLSX.write(sourceWorkbookWith(rows), { bookType: 'xlsx', type: 'array' }));
     await writable.close();
     return true;
   }
 
-  async function pickAndLinkExcel() {
-    if (!confirmReplaceUnsaved()) return;
-    let handle;
+  const isPdfFile = f => /\.pdf$/i.test(f.name) || f.type === 'application/pdf';
+
+  // One Upload for everything: Excel files open into the list, bank PDFs go
+  // to the statement review. `handles` (Chrome/Edge) let Save update the file.
+  async function routeUploads(files, handles = []) {
+    const pdfs = files.filter(isPdfFile);
+    const excels = files.filter(f => !isPdfFile(f) && /\.xlsx?$/i.test(f.name));
+    const other = files.length - pdfs.length - excels.length;
+    if (other) showStatus(`⚠️ Skipped ${other} file${other === 1 ? '' : 's'} — Upload takes Excel (.xlsx) and bank statement PDFs.`, true);
+    if (excels.length) {
+      if (excels.length > 1) {
+        showStatus('ℹ️ Opened the first Excel file only. For a whole year, use Reports → Year summary → Load monthly files.');
+      }
+      const file = excels[0];
+      if (confirmReplaceUnsaved()) {
+        const handle = handles[files.indexOf(file)] || null;
+        // Only .xlsx can be written back; .xls files are saved as a new .xlsx
+        const writable = handle && /\.xlsx$/i.test(file.name) ? handle : null;
+        const ok = await importWorkbook(file, writable);
+        if (ok) storeSourceHandle(writable);
+      }
+    }
+    if (pdfs.length) importStatementFiles(pdfs);
+  }
+
+  async function chooseUploadFiles() {
+    if (!(typeof window.showOpenFilePicker === 'function')) {
+      document.getElementById('uploadAny').click();
+      return;
+    }
+    let handles;
     try {
-      [handle] = await window.showOpenFilePicker({
+      handles = await window.showOpenFilePicker({
+        multiple: true,
         types: [{
-          description: 'Excel files',
+          description: 'Excel or bank statement PDF',
           accept: {
             'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'],
-            'application/vnd.ms-excel': ['.xls']
+            'application/vnd.ms-excel': ['.xls'],
+            'application/pdf': ['.pdf']
           }
         }]
       });
     } catch (e) {
       return; // picker cancelled
     }
-    // Only .xlsx can be written back; .xls files are saved as a new .xlsx
-    const writable = /\.xlsx$/i.test(handle.name);
-    const ok = await importWorkbook(await handle.getFile(), writable ? handle : null);
-    if (ok) storeSourceHandle(writable ? handle : null);
+    const files = await Promise.all(handles.map(h => h.getFile()));
+    routeUploads(files, handles);
   }
 
   function confirmReplaceUnsaved() {
@@ -2128,13 +3336,43 @@
 
   // Accepts rows from any Moneta export — old files without a Category
   // column and files re-saved by Excel included — and normalizes them.
+  // Reads an amount however it was typed: 1234.5, "1,234.50", "$1,234.50",
+  // "(25.00)" or "25.00-" (negative), "CA$ 12". Returns '' for blanks.
+  function parseAmount(v) {
+    if (v === undefined || v === null || v === '') return '';
+    if (typeof v === 'number') return isFinite(v) ? v : 0;
+    let t = String(v).trim();
+    if (!t) return '';
+    const negative = /^\(.*\)$/.test(t) || /-$/.test(t) || /^[-−]/.test(t);
+    t = t.replace(/[^0-9.]/g, '');
+    const n = parseFloat(t);
+    if (!isFinite(n)) return 0;
+    return negative ? -n : n;
+  }
+
+  // A "Total" / "Balance" line someone added to their sheet is not a transaction.
+  // Real purchases have a date, so only undated rows can be summary lines
+  // (a store called "Total Wine" with a date is kept).
+  function isSummaryRow(row) {
+    if (/^\d{4}-\d{2}-\d{2}$/.test(excelDateToStr(row['Date']))) return false;
+    const label = [row['Purchased Store'], row['Purchased By'], row['Date']]
+      .map(v => String(v ?? '').trim()).join(' ').trim().toLowerCase();
+    if (/^((grand\s*)?totals?|sub-?totals?|(opening|closing|ending|starting)?\s*balance|net|sum)\b/.test(label)) return true;
+    // No description and no person but amounts filled in: a formula row
+    const noText = !String(row['Purchased Store'] ?? '').trim() && !String(row['Purchased By'] ?? '').trim();
+    return noText && (parseAmount(row['Debit [D]']) !== '' || parseAmount(row['Credit [C]']) !== '');
+  }
+
   function normalizeRow(row) {
-    const debitRaw = row['Debit [D]'];
-    const creditRaw = row['Credit [C]'];
-    const debit = (debitRaw === undefined || debitRaw === '') ? '' : (Number(debitRaw) || 0);
-    const credit = (creditRaw === undefined || creditRaw === '') ? '' : (Number(creditRaw) || 0);
-    let amount = Number(row['Amount Total']);
-    if (!isFinite(amount)) amount = (Number(debit) || 0) + (Number(credit) || 0);
+    let debit = parseAmount(row['Debit [D]']);
+    let credit = parseAmount(row['Credit [C]']);
+    // A negative debit is money coming in (and vice versa)
+    if (debit !== '' && debit < 0) { credit = (credit === '' ? 0 : credit) + -debit; debit = ''; }
+    if (credit !== '' && credit < 0) { debit = (debit === '' ? 0 : debit) + -credit; credit = ''; }
+    if (debit === 0 && credit !== '') debit = '';
+    if (credit === 0 && debit !== '') credit = '';
+    let amount = parseAmount(row['Amount Total']);
+    if (amount === '' || !isFinite(amount) || amount < 0) amount = (Number(debit) || 0) + (Number(credit) || 0);
 
     const entry = {
       'Date': excelDateToStr(row['Date']),
@@ -2146,7 +3384,37 @@
       'Amount Total': amount
     };
     if (row['Category']) entry['Category'] = String(row['Category']).trim();
+    // Optional note/tag (newer files only), e.g. "Banff trip"
+    const note = String(row['Notes'] ?? '').replace(/\s+/g, ' ').trim().slice(0, 200);
+    if (note) entry['Notes'] = note;
     return entry;
+  }
+
+  // Reads every sheet that holds transactions (a Date column plus Debit,
+  // Credit or Amount Total); other sheets such as notes or summaries are left
+  // alone. Falls back to the first sheet so very old files still open.
+  function readWorkbookRows(wb) {
+    const AMOUNT_COLS = ['Debit [D]', 'Credit [C]', 'Amount Total'];
+    const sheets = [];
+    let summaryRows = 0;
+    const read = name => {
+      const raw = XLSX.utils.sheet_to_json(wb.Sheets[name]);
+      summaryRows += raw.filter(isSummaryRow).length;
+      return raw.filter(r => !isSummaryRow(r)).map(normalizeRow);
+    };
+    wb.SheetNames.forEach(name => {
+      const ws = wb.Sheets[name];
+      if (!ws) return;
+      const header = (XLSX.utils.sheet_to_json(ws, { header: 1 })[0] || []).map(h => String(h).trim());
+      if (!header.includes('Date') || !AMOUNT_COLS.some(c => header.includes(c))) return;
+      const rows = read(name);
+      if (rows.length) sheets.push({ name, rows });
+    });
+    if (!sheets.length && wb.SheetNames.length) {
+      const rows = read(wb.SheetNames[0]);
+      if (rows.length) sheets.push({ name: wb.SheetNames[0], rows });
+    }
+    return { sheets, rows: sheets.flatMap(s => s.rows), summaryRows };
   }
 
   function uploadExcel(event) {
@@ -2164,17 +3432,19 @@
       if (file.size > 20 * 1024 * 1024) throw new Error('File is larger than 20 MB.');
       const data = new Uint8Array(await file.arrayBuffer());
       const workbook = XLSX.read(data, { type: 'array' });
-      const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-      const jsonData = firstSheet ? XLSX.utils.sheet_to_json(firstSheet) : [];
-      if (jsonData.length === 0) {
-        showStatus('❌ No data found in the Excel file.', true);
+      const read = readWorkbookRows(workbook);
+      const summaryRows = read.summaryRows;
+      if (!read.rows.length) {
+        showStatus('❌ No transactions found in the Excel file.', true);
         return false;
       }
-      budgetData = jsonData.map(normalizeRow);
+      budgetData = read.rows;
       rememberStores(budgetData);
       source = {
         name: file.name,
         months: [...new Set(budgetData.map(monthKeyOf).filter(Boolean))],
+        // Which months came from which sheet, so Save puts them back there
+        sheets: read.sheets.map(sh => ({ name: sh.name, months: [...new Set(sh.rows.map(monthKeyOf).filter(Boolean))] })),
         handle,
         workbook
       };
@@ -2187,6 +3457,8 @@
       renderTable();
       const dups = countDuplicates(budgetData);
       showStatus(`✅ Opened ${budgetData.length} transaction${budgetData.length > 1 ? 's' : ''} from ${file.name}` +
+        (read.sheets.length > 1 ? ` (${read.sheets.length} sheets)` : '') +
+        (summaryRows ? ` · skipped ${summaryRows} total row${summaryRows === 1 ? '' : 's'}` : '') +
         (dups ? ` · ⚠️ ${dups} look${dups === 1 ? 's' : ''} like duplicate${dups === 1 ? '' : 's'}` : ''));
       return true;
     } catch (error) {
@@ -2213,11 +3485,8 @@
           try {
             const data = new Uint8Array(e.target.result);
             const workbook = XLSX.read(data, { type: 'array' });
-            const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-            const jsonData = XLSX.utils.sheet_to_json(firstSheet);
-            
-            jsonData.forEach(raw => {
-              const row = normalizeRow(raw);
+
+            readWorkbookRows(workbook).rows.forEach(row => {
               if (row['Date']) {
                 const parts = row['Date'].split('-');
                 if (parts.length >= 2) {
@@ -2412,6 +3681,9 @@
     });
     return groups;
   }
+  // Forecasts start once a week of the month has passed
+  const FORECAST_MIN_DAYS = 7;
+
   // Straight-line month-end projection from spending so far
   function forecastMonth(spentC, elapsedDays, daysInMonth) {
     if (!(elapsedDays > 0)) return spentC;
@@ -2442,6 +3714,189 @@
     scored.sort((a, b) => a.rank - b.rank || (b.e.count || 0) - (a.e.count || 0) ||
       (b.e.used || 0) - (a.e.used || 0) || a.e.name.localeCompare(b.e.name));
     return scored.slice(0, limit).map(s => s.e);
+  }
+  // Even split: who pays whom so everyone has paid the same share.
+  // paid = { name: cents }. Returns [{ from, to, cents }] with the fewest transfers
+  // (greedy largest-first); rounding cents go to the first people listed.
+  function settleUp(paid) {
+    const names = Object.keys(paid);
+    if (names.length < 2) return [];
+    const total = names.reduce((s, n) => s + paid[n], 0);
+    const base = Math.floor(total / names.length);
+    let extra = total - base * names.length;
+    const balance = names.map(n => {
+      const share = base + (extra > 0 ? 1 : 0);
+      if (extra > 0) extra--;
+      return { n, bal: paid[n] - share };
+    });
+    const owes = balance.filter(b => b.bal < 0).sort((a, b) => a.bal - b.bal);
+    const gets = balance.filter(b => b.bal > 0).sort((a, b) => b.bal - a.bal);
+    const out = [];
+    let i = 0;
+    let j = 0;
+    while (i < owes.length && j < gets.length) {
+      const amt = Math.min(-owes[i].bal, gets[j].bal);
+      if (amt > 0) out.push({ from: owes[i].n, to: gets[j].n, cents: amt });
+      owes[i].bal += amt;
+      gets[j].bal -= amt;
+      if (owes[i].bal === 0) i++;
+      if (gets[j].bal === 0) j++;
+    }
+    return out;
+  }
+  // Finds likely subscriptions/bills: the same store charged in 2+ different
+  // months for about the same amount (within 10%). Skips transfers and anything
+  // already set up as recurring.
+  function detectRecurring(rows, existing) {
+    const known = new Set((existing || []).map(r => String(r.desc || '').trim().toLowerCase()));
+    const byStore = new Map();
+    rows.forEach(r => {
+      const c = classify(r);
+      const month = monthKeyOf(r);
+      const name = String(r['Purchased Store'] || '').trim();
+      if (!name || !month || c.kind === 'transfer' || c.kind === 'refund') return;
+      const cents = c.kind === 'income' ? c.income : c.spend;
+      if (cents <= 0) return;
+      const key = name.toLowerCase();
+      if (known.has(key)) return;
+      if (!byStore.has(key)) byStore.set(key, []);
+      byStore.get(key).push({ r, month, cents, type: c.kind === 'income' ? 'C' : 'D' });
+    });
+    const median = arr => { const a = [...arr].sort((x, y) => x - y); return a[Math.floor(a.length / 2)]; };
+    const found = [];
+    byStore.forEach(list => {
+      // One charge per month (the largest) so a second purchase doesn't count twice
+      const perMonth = new Map();
+      list.forEach(x => { if (!perMonth.has(x.month) || perMonth.get(x.month).cents < x.cents) perMonth.set(x.month, x); });
+      const months = [...perMonth.values()];
+      if (months.length < 2) return;
+      const amounts = months.map(x => x.cents);
+      const mid = median(amounts);
+      if (!amounts.every(a => Math.abs(a - mid) <= mid * 0.1)) return;
+      const latest = months.sort((a, b) => b.month.localeCompare(a.month))[0];
+      found.push({
+        desc: String(latest.r['Purchased Store']).trim(),
+        amount: mid / 100,
+        day: median(months.map(x => dayOf(x.r)).filter(Boolean)) || 1,
+        payer: latest.r['Purchased By'] || '',
+        bank: latest.r['Bank Name'] || '',
+        type: latest.type,
+        months: months.length
+      });
+    });
+    return found.sort((a, b) => b.months - a.months || b.amount - a.amount).slice(0, 8);
+  }
+  // Year summary grid: { categories: [{ name, months[12], total }], income[12],
+  // spent[12], net[12] } in cents — same rules as every other total
+  function yearSummary(rows, year) {
+    const prefix = `${year}-`;
+    const cats = new Map();
+    const income = new Array(12).fill(0);
+    const spent = new Array(12).fill(0);
+    rows.forEach(r => {
+      const key = monthKeyOf(r);
+      if (!key || !key.startsWith(prefix)) return;
+      const m = Number(key.slice(5, 7)) - 1;
+      const c = classify(r);
+      income[m] += c.income;
+      if (c.spend) {
+        spent[m] += c.spend;
+        const name = getCategory(r);
+        if (!cats.has(name)) cats.set(name, new Array(12).fill(0));
+        cats.get(name)[m] += c.spend;
+      }
+    });
+    const categories = [...cats.entries()]
+      .map(([name, months]) => ({ name, months, total: months.reduce((a, b) => a + b, 0) }))
+      .filter(c => c.total !== 0)
+      .sort((a, b) => b.total - a.total);
+    return { categories, income, spent, net: income.map((v, i) => v - spent[i]) };
+  }
+  // Name matching key: ignores case, spacing, punctuation and store/branch
+  // numbers, so "COSTCO #512", "Costco 512" and "costco" are the same store
+  function nameKey(name) {
+    return String(name || '').toLowerCase()
+      .replace(/[#*]\s*\d+/g, ' ')          // #512, *1234
+      .replace(/[^a-z0-9&+ ]+/g, ' ')         // punctuation
+      .replace(/\b\d+\b/g, ' ')              // standalone numbers
+      .replace(/\s+/g, ' ').trim();
+  }
+
+  // 0–1 similarity from edit distance ("house rent" vs "home rent" ≈ 0.8)
+  function nameSimilarity(a, b) {
+    if (a === b) return 1;
+    const m = a.length;
+    const n = b.length;
+    if (!m || !n) return 0;
+    let prev = Array.from({ length: n + 1 }, (_, j) => j);
+    for (let i = 1; i <= m; i++) {
+      const cur = [i];
+      for (let j = 1; j <= n; j++) {
+        cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      }
+      prev = cur;
+    }
+    return 1 - prev[n] / Math.max(m, n);
+  }
+
+  // Pairs of names that are probably the same thing, for you to confirm.
+  // names: [{ key, name, count }] (distinct keys). skip: Set of "keyA|keyB" you said differ.
+  function findSimilarNames(names, skip) {
+    const list = names.filter(x => x.key.length >= 4).slice(0, 400);
+    const pairs = [];
+    for (let i = 0; i < list.length; i++) {
+      for (let j = i + 1; j < list.length; j++) {
+        const a = list[i];
+        const b = list[j];
+        const id = [a.key, b.key].sort().join('|');
+        if (skip && skip.has(id)) continue;
+        const sim = nameSimilarity(a.key, b.key);
+        const wordsA = a.key.split(' ');
+        const wordsB = b.key.split(' ');
+        // One name is the other plus extra words ("shell" / "shell gas")
+        const contained = (wordsA.every(w => wordsB.includes(w)) || wordsB.every(w => wordsA.includes(w))) &&
+          Math.min(a.key.length, b.key.length) >= 4;
+        if (sim >= 0.75 || contained) pairs.push({ a, b, id, score: Math.max(sim, contained ? 0.7 : 0) });
+      }
+    }
+    return pairs.sort((x, y) => y.score - x.score || (y.a.count + y.b.count) - (x.a.count + x.b.count)).slice(0, 12);
+  }
+  // Savings goal progress. goal: { target, saved, by: 'YYYY-MM' | '' }.
+  // perMonthC = what to put aside each month (this one included) to finish on time.
+  function goalPlan(goal, currentMonth) {
+    const targetC = toCents(goal.target);
+    const savedC = toCents(goal.saved);
+    const leftC = Math.max(0, targetC - savedC);
+    const pct = targetC > 0 ? Math.min(100, (savedC / targetC) * 100) : 0;
+    let monthsLeft = null;
+    let perMonthC = null;
+    if (/^\d{4}-\d{2}$/.test(goal.by || '')) {
+      const [y1, m1] = currentMonth.split('-').map(Number);
+      const [y2, m2] = goal.by.split('-').map(Number);
+      monthsLeft = (y2 - y1) * 12 + (m2 - m1) + 1;
+      perMonthC = monthsLeft > 0 ? Math.ceil(leftC / monthsLeft) : leftC;
+    }
+    return { targetC, savedC, leftC, pct, monthsLeft, perMonthC, done: leftC === 0 && targetC > 0 };
+  }
+
+  // Bills from your recurring list that are due soon or overdue this month and
+  // not in the transactions yet. today: 'YYYY-MM-DD'. dismissed: Set of "name|YYYY-MM".
+  function dueReminders(recurring, rows, today, windowDays, dismissed) {
+    const month = today.slice(0, 7);
+    const [y, m, d] = today.split('-').map(Number);
+    const lastDay = new Date(y, m, 0).getDate();
+    const recorded = new Set(rows.filter(r => monthKeyOf(r) === month).map(r => nameKey(r['Purchased Store'])));
+    const out = [];
+    (recurring || []).forEach(rec => {
+      if (rec.type === 'C' || !rec.desc) return; // reminders are for bills
+      const key = nameKey(rec.desc);
+      if (recorded.has(key) || (dismissed && dismissed.has(`${key}|${month}`))) return;
+      const day = Math.min(Math.max(parseInt(rec.day, 10) || 1, 1), lastDay);
+      const daysUntil = day - d;
+      if (daysUntil > windowDays) return;
+      out.push({ rec, key, date: `${month}-${String(day).padStart(2, '0')}`, daysUntil, overdue: daysUntil < 0 });
+    });
+    return out.sort((a, b) => a.daysUntil - b.daysUntil);
   }
   // ---- end pure helpers ----
 
@@ -2489,6 +3944,9 @@
     const empty = budgetData.length === 0;
     document.getElementById('dashEmpty').hidden = !empty;
     document.getElementById('dashCharts').hidden = empty;
+    document.getElementById('overviewSection').classList.toggle('is-empty', empty);
+    document.querySelector('.table-section').classList.toggle('is-empty', empty);
+    renderReminders(); // bills due show even before any file is opened
     if (empty) return;
 
     // Redrawn on every table render, so skip animation to avoid flicker
@@ -2497,6 +3955,163 @@
     renderPacePanel(rows, prevRows, prevKey, theme);
     renderTrendPanel(months, theme);
     renderTopStores(rows);
+    renderSettleUp(rows);
+    renderGoals();
+  }
+
+  // ---- Savings goals ----
+  function renderGoals() {
+    const panel = document.getElementById('goalsPanel');
+    const goals = getSettings().goals;
+    panel.hidden = !goals.length;
+    if (!goals.length) return;
+    const now = todayStr().slice(0, 7);
+    const colors = seriesColors(chartTheme(), goals.length);
+    document.getElementById('goalsList').innerHTML = goals.map((g, i) => {
+      const plan = goalPlan(g, now);
+      const by = g.by ? monthLabelOf(g.by, { month: 'short', year: 'numeric' }) : '';
+      const hint = plan.done ? '🎉 Reached!'
+        : plan.monthsLeft !== null
+          ? (plan.monthsLeft > 0 ? `${fmtMoney(plan.leftC / 100)} to go · ${fmtMoney(plan.perMonthC / 100)}/month to reach it by ${escapeHtml(by)}` : `${fmtMoney(plan.leftC / 100)} to go · target date ${escapeHtml(by)} has passed`)
+          : `${fmtMoney(plan.leftC / 100)} to go`;
+      return `<li class="goal" data-goal="${escapeHtml(g.id)}">
+        <div class="top-row"><span class="top-name">${escapeHtml(g.name)}</span><span class="top-amount">${fmtMoney(plan.savedC / 100)} <span class="muted">/ ${fmtMoney(plan.targetC / 100)}</span></span></div>
+        <div class="top-bar"><span style="width: ${Math.max(2, plan.pct)}%; background: ${colors[i]}"></span></div>
+        <div class="goal-foot"><span>${hint}</span>
+          <span class="goal-add"><input type="number" step="0.01" inputmode="decimal" placeholder="Amount" aria-label="Amount to add to ${escapeHtml(g.name)}">
+          <button type="button" class="pill-btn ghost" data-action="addToGoal" data-id="${escapeHtml(g.id)}"><i class="fas fa-plus"></i> Add</button></span>
+        </div>
+      </li>`;
+    }).join('');
+  }
+
+  function addGoal() {
+    const name = document.getElementById('goalName').value.trim().slice(0, 60);
+    const target = parseFloat(document.getElementById('goalTarget').value);
+    const by = document.getElementById('goalBy').value; // YYYY-MM or ''
+    if (!name || !(target > 0)) {
+      showStatus('⚠️ A goal needs a name and a target above zero.', true);
+      return;
+    }
+    const settings = getSettings();
+    settings.goals.push({ id: `g${Date.now().toString(36)}`, name, target: toCents(target) / 100, saved: 0, by: /^\d{4}-\d{2}$/.test(by) ? by : '' });
+    saveSettings(settings);
+    ['goalName', 'goalTarget', 'goalBy'].forEach(id => { document.getElementById(id).value = ''; });
+    populateSettingsUI();
+    renderDashboard();
+    showStatus(`🎯 Goal “${name}” added.`);
+  }
+
+  // Positive amounts add to the goal, negative ones take money out
+  function addToGoal(id, input) {
+    const amount = parseFloat(input.value);
+    if (!isFinite(amount) || amount === 0) { input.focus(); return; }
+    const settings = getSettings();
+    const g = settings.goals.find(x => x.id === id);
+    if (!g) return;
+    g.saved = Math.max(0, (toCents(g.saved) + toCents(amount)) / 100);
+    saveSettings(settings);
+    renderDashboard();
+    showStatus(`🎯 ${fmtMoney(Math.abs(amount))} ${amount > 0 ? 'added to' : 'taken from'} “${g.name}”.`);
+  }
+
+  function removeGoal(id) {
+    const settings = getSettings();
+    settings.goals = settings.goals.filter(g => g.id !== id);
+    saveSettings(settings);
+    populateSettingsUI();
+    renderDashboard();
+  }
+
+  // ---- Bill reminders ----
+  const DISMISS_KEY = 'spendwise_dismissed';
+  let currentReminders = [];
+
+  function dismissedReminders() {
+    try { return new Set(JSON.parse(localStorage.getItem(DISMISS_KEY)) || []); } catch (e) { return new Set(); }
+  }
+
+  function renderReminders() {
+    const box = document.getElementById('reminders');
+    currentReminders = dueReminders(getSettings().recurring, budgetData, todayStr(), 5, dismissedReminders());
+    box.hidden = !currentReminders.length;
+    if (!currentReminders.length) { box.innerHTML = ''; return; }
+    box.innerHTML = currentReminders.map((x, i) => {
+      const when = x.overdue ? `was due ${escapeHtml(shortDate(x.date))}` : x.daysUntil === 0 ? 'due today' : x.daysUntil === 1 ? 'due tomorrow' : `due in ${x.daysUntil} days (${escapeHtml(shortDate(x.date))})`;
+      return `<div class="reminder ${x.overdue ? 'overdue' : ''}">
+        <i class="fas ${x.overdue ? 'fa-circle-exclamation' : 'fa-bell'}" aria-hidden="true"></i>
+        <span><strong>${escapeHtml(x.rec.desc)}</strong> ${fmtMoney(x.rec.amount)} · ${when}</span>
+        <span class="reminder-actions">
+          <button type="button" class="pill-btn ghost" data-action="recordReminder" data-index="${i}">Add it</button>
+          <button type="button" class="pill-btn ghost" data-action="dismissReminder" data-index="${i}" aria-label="Dismiss reminder for ${escapeHtml(x.rec.desc)}">Dismiss</button>
+        </span>
+      </div>`;
+    }).join('');
+  }
+
+  function recordReminder(index) {
+    const x = currentReminders[index];
+    if (!x) return;
+    const r = x.rec;
+    const amount = toCents(r.amount) / 100;
+    const entry = {
+      'Date': x.date,
+      'Purchased By': r.payer || '',
+      'Purchased Store': r.desc,
+      'Bank Name': r.bank || '',
+      'Debit [D]': amount,
+      'Credit [C]': '',
+      'Amount Total': amount
+    };
+    budgetData.push(entry);
+    rememberStores([entry]);
+    markChanged();
+    renderTable();
+    showStatus(`✅ ${r.desc} ${fmtMoney(amount)} added for ${shortDate(x.date)}.`);
+  }
+
+  function dismissReminder(index) {
+    const x = currentReminders[index];
+    if (!x) return;
+    const set = dismissedReminders();
+    set.add(`${x.key}|${x.date.slice(0, 7)}`);
+    // Keep only this year's dismissals
+    const keep = [...set].filter(k => k.slice(-7, -3) >= String(new Date().getFullYear() - 1));
+    try { localStorage.setItem(DISMISS_KEY, JSON.stringify(keep)); } catch (e) { /* ignore */ }
+    renderReminders();
+  }
+
+  // Spending per person and the transfers that would even it up
+  function renderSettleUp(rows) {
+    const panel = document.getElementById('settlePanel');
+    const paid = {};
+    let unassignedC = 0;
+    rows.forEach(r => {
+      const c = spendOf(r);
+      if (!c) return;
+      const who = String(r['Purchased By'] || '').trim();
+      if (who) paid[who] = (paid[who] || 0) + c;
+      else unassignedC += c;
+    });
+    const people = Object.keys(paid).filter(n => paid[n] !== 0);
+    if (people.length < 2) { panel.hidden = true; return; }
+    panel.hidden = false;
+    const total = people.reduce((s, n) => s + paid[n], 0);
+    const max = Math.max(...people.map(n => Math.abs(paid[n])));
+    document.getElementById('settleSub').textContent =
+      `${fmtMoney(total / 100)} shared by ${people.length} people · ${fmtMoney(total / people.length / 100)} each` +
+      (unassignedC ? ` · ${fmtMoney(unassignedC / 100)} without a person not included` : '');
+    const transfers = settleUp(Object.fromEntries(people.map(n => [n, paid[n]])));
+    const colors = seriesColors(chartTheme(), people.length);
+    document.getElementById('settleList').innerHTML =
+      people.sort((a, b) => paid[b] - paid[a]).map((n, i) => `
+        <li>
+          <div class="top-row"><span class="top-name">${escapeHtml(n)}</span><span class="top-amount">${fmtMoney(paid[n] / 100)}</span></div>
+          <div class="top-bar"><span style="width: ${Math.max(2, (Math.abs(paid[n]) / max) * 100)}%; background: ${colors[i]}"></span></div>
+        </li>`).join('') +
+      `<li class="settle-result">${transfers.length
+        ? transfers.map(t => `<div><i class="fas fa-arrow-right-arrow-left" aria-hidden="true"></i> <strong>${escapeHtml(t.from)}</strong> pays <strong>${escapeHtml(t.to)}</strong> ${fmtMoney(t.cents / 100)}</div>`).join('')
+        : '<div><i class="fas fa-circle-check" aria-hidden="true"></i> All even — nobody owes anything</div>'}</li>`;
   }
 
   function renderKpis(rows, prevRows, prevLabel) {
@@ -2527,7 +4142,7 @@
     }
     const diff = cur - prev;
     if (Math.abs(diff) < 0.005) {
-      el.textContent = `Same as ${prevLabel}`;
+      el.innerHTML = `Same as <span class="nowrap">${escapeHtml(prevLabel)}</span>`;
       return;
     }
     const text = kind === 'pct' ? `${Math.abs((diff / prev) * 100).toFixed(0)}%`
@@ -2535,7 +4150,7 @@
       : fmtMoney(Math.abs(diff));
     const up = diff > 0;
     el.classList.add(up === goodWhenUp ? 'good' : 'bad');
-    el.innerHTML = `<i class="fas fa-arrow-${up ? 'up' : 'down'}" aria-hidden="true"></i> ${up ? 'Up' : 'Down'} ${escapeHtml(text)} vs ${escapeHtml(prevLabel)}`;
+    el.innerHTML = `<i class="fas fa-arrow-${up ? 'up' : 'down'}" aria-hidden="true"></i> ${up ? 'Up' : 'Down'} ${escapeHtml(text)} <span class="nowrap">vs ${escapeHtml(prevLabel)}</span>`;
   }
 
   function renderCategoryPanel(rows, theme) {
@@ -2576,6 +4191,16 @@
         responsive: true,
         maintainAspectRatio: false,
         layout: { padding: { right: 56 } },
+        // Click a bar to see those transactions ("Other (n more)" is a bundle, so not clickable)
+        onClick: (evt, els) => {
+          const i = els.length ? els[0].index : -1;
+          if (i < 0 || (rest.length && i === top.length - 1)) return;
+          filterTableTo({ category: top[i][0] });
+        },
+        onHover: (evt, els) => {
+          const i = els.length ? els[0].index : -1;
+          evt.native.target.style.cursor = (i >= 0 && !(rest.length && i === top.length - 1)) ? 'pointer' : 'default';
+        },
         plugins: {
           legend: chartLegend(theme, false),
           tooltip: chartTooltip(theme, { label: shareLabel }),
@@ -2609,7 +4234,7 @@
         if (d >= 1 && d <= perDay.length) perDay[d - 1] += spendOf(r);
       });
       let run = 0;
-      return perDay.slice(0, upTo).map(c => (run += c) / 100);
+      return perDay.slice(0, upTo).map(c => Math.max(0, (run += c)) / 100);
     };
 
     const isCurrent = dashActive === todayStr().slice(0, 7);
@@ -2621,7 +4246,8 @@
     const prevName = monthLabelOf(prevKey, { month: 'short' });
 
     const spentSoFar = curSeries[curSeries.length - 1] || 0;
-    const projection = isCurrent && shownDays < daysIn(dashActive)
+    // A projection from the first few days would be a wild guess
+    const projection = isCurrent && shownDays >= FORECAST_MIN_DAYS && shownDays < daysIn(dashActive)
       ? ` · on pace for ${fmtMoney(forecastMonth(Math.round(spentSoFar * 100), shownDays, daysIn(dashActive)) / 100)}` : '';
     if (prevSeries) {
       const prevAtSameDay = prevSeries[Math.min(shownDays, prevSeries.length) - 1] || 0;
@@ -2729,9 +4355,10 @@
     const stores = {};
     rows.forEach(r => {
       const c = spendOf(r);
-      const name = String(r['Purchased Store'] || '').trim();
-      if (!c || !name) return;
-      const key = name.toLowerCase();
+      const raw = String(r['Purchased Store'] || '').trim();
+      if (!c || !raw) return;
+      const name = displayName(raw);
+      const key = nameKey(name) || name.toLowerCase();
       if (!stores[key]) stores[key] = { name, cents: 0, count: 0 };
       stores[key].cents += c;
       stores[key].count++;
@@ -2743,15 +4370,37 @@
       return;
     }
     const max = top[0].cents;
-    list.innerHTML = top.map(s => `
-      <li>
+    const colors = seriesColors(chartTheme(), top.length);
+    list.innerHTML = top.map((s, i) => `
+      <li class="top-item" role="button" tabindex="0" data-store="${escapeHtml(s.name)}" aria-label="Show ${escapeHtml(s.name)} transactions">
         <div class="top-row">
           <span class="top-name">${escapeHtml(s.name)}</span>
           <span class="top-amount">${fmtMoney(s.cents / 100)}</span>
         </div>
         <div class="top-meta">${s.count} purchase${s.count > 1 ? 's' : ''}</div>
-        <div class="top-bar"><span style="width: ${Math.max(2, (s.cents / max) * 100)}%"></span></div>
+        <div class="top-bar"><span style="width: ${Math.max(2, (s.cents / max) * 100)}%; background: ${colors[i]}"></span></div>
       </li>`).join('');
+  }
+
+  // Dashboard → table: show the matching transactions for the month on screen
+  function filterTableTo({ category = '', search = '' }) {
+    categoryFilter = category;
+    searchInput.value = search;
+    filterMinAmount.value = '';
+    filterMaxAmount.value = '';
+    const preset = document.getElementById('datePreset');
+    if (dashActive !== 'all') {
+      const [y, m] = dashActive.split('-').map(Number);
+      filterStartDate.value = `${dashActive}-01`;
+      filterEndDate.value = `${dashActive}-${String(new Date(y, m, 0).getDate()).padStart(2, '0')}`;
+      preset.value = 'custom';
+    } else {
+      filterStartDate.value = '';
+      filterEndDate.value = '';
+      preset.value = 'all';
+    }
+    renderTable();
+    document.querySelector('.table-section').scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
   const dashPeriodSelect = document.getElementById('dashPeriod');
@@ -2804,7 +4453,6 @@
         maintainAspectRatio: false,
         layout: { padding: 8 },
         plugins: {
-          title: chartTitle(theme, 'Total Cashflow Summary'),
           legend: chartLegend(theme),
           tooltip: chartTooltip(theme, { label: sliceLabel }),
           centerText: {
@@ -2868,7 +4516,6 @@
         maintainAspectRatio: false,
         layout: { padding: 8 },
         plugins: {
-          title: chartTitle(theme, 'Expenditure Breakdown'),
           legend: chartLegend(theme),
           tooltip: chartTooltip(theme, { label: sliceLabel }),
           centerText: {
@@ -2978,7 +4625,6 @@
         maintainAspectRatio: false,
         interaction: { mode: 'index', intersect: false },
         plugins: {
-          title: chartTitle(theme, 'Monthly Financial Trends'),
           subtitle: chartSubtitle(theme, labels.length > 1 ? `${labels[0]} — ${labels[labels.length - 1]}` : labels[0] || ''),
           legend: chartLegend(theme),
           tooltip: chartTooltip(theme, {
@@ -3022,7 +4668,7 @@
         datasets: [{
           label: 'Spending',
           data: Object.values(sortedBanks),
-          backgroundColor: theme.net,
+          backgroundColor: seriesColors(theme, Object.keys(sortedBanks).length),
           borderRadius: 4,
           maxBarThickness: 24
         }]
@@ -3033,7 +4679,6 @@
         maintainAspectRatio: false,
         layout: { padding: { right: 56 } }, // room for the tip labels
         plugins: {
-          title: chartTitle(theme, 'Spending by Bank/Account'),
           subtitle: chartSubtitle(theme, 'Total spent per account'),
           legend: chartLegend(theme, false), // single series — the title says it all
           tooltip: chartTooltip(theme, { label: shareLabel }),
@@ -3077,7 +4722,7 @@
         datasets: [{
           label: 'Total Spent',
           data: Object.values(sortedPersons),
-          backgroundColor: theme.net,
+          backgroundColor: seriesColors(theme, Object.keys(sortedPersons).length),
           borderRadius: 4,
           maxBarThickness: 24
         }]
@@ -3087,7 +4732,6 @@
         maintainAspectRatio: false,
         layout: { padding: { top: 24 } }, // room for the tip labels
         plugins: {
-          title: chartTitle(theme, 'Spending Distribution by Person'),
           subtitle: chartSubtitle(theme, 'Total spent per person'),
           legend: chartLegend(theme, false), // single series — the title says it all
           tooltip: chartTooltip(theme, { label: shareLabel }),
@@ -3341,7 +4985,36 @@
     removeCategoryByIndex: el => removeCategoryByIndex(Number(el.dataset.index)),
     addRecurringSetting: () => addRecurringSetting(),
     removeRecurring: el => removeRecurring(Number(el.dataset.index)),
+    addDetectedRecurring: el => addDetectedRecurring(Number(el.dataset.index)),
+    mergeSuggestion: el => {
+      const p = nameSuggestions[Number(el.dataset.index)];
+      if (!p) return;
+      const keep = el.dataset.keep === 'a' ? p.a : p.b;
+      const drop = el.dataset.keep === 'a' ? p.b : p.a;
+      mergeNames(drop.name, keep.name);
+    },
+    notSameSuggestion: el => {
+      const p = nameSuggestions[Number(el.dataset.index)];
+      if (p) markNotSame(p.id);
+    },
+    removeAlias: el => removeAlias(el.dataset.key),
+    startCategoryEdit: el => { editingCategory = el.dataset.cat; renderBuiltinCategories(); const f = document.querySelector('#builtinCats .cat-edit-name'); if (f) f.focus(); },
+    cancelCategoryEdit: () => { editingCategory = null; renderBuiltinCategories(); },
+    saveCategoryEdit: el => saveCategoryEdit(el.dataset.cat),
+    toggleCategoryHidden: el => toggleCategoryHidden(el.dataset.cat),
+    resetCategoryEdit: el => resetCategoryEdit(el.dataset.cat),
+    showMoreRows: () => { tableLimit += TABLE_PAGE; renderTable(); },
+    addGoal: () => addGoal(),
+    removeGoal: el => removeGoal(el.dataset.id),
+    addToGoal: el => addToGoal(el.dataset.id, el.closest('.goal-add').querySelector('input')),
+    recordReminder: el => recordReminder(Number(el.dataset.index)),
+    dismissReminder: el => dismissReminder(Number(el.dataset.index)),
     resetAllLocalData: () => resetAllLocalData(),
+    clearDeviceData: () => clearDeviceData(),
+    backToReports: () => {
+      document.querySelectorAll('.modal').forEach(m => { m.style.display = 'none'; });
+      openReportsHub();
+    },
     editRow: el => openEditor(Number(el.dataset.index)),
     removeRow: el => removeRow(Number(el.dataset.index))
   };
@@ -3381,6 +5054,12 @@
   document.getElementById('editSave').addEventListener('click', saveEdit);
   document.getElementById('editCancel').addEventListener('click', closeEditor);
   document.getElementById('editDuplicate').addEventListener('click', duplicateFromEditor);
+  document.getElementById('editSplit').addEventListener('click', () =>
+    toggleSplit(document.getElementById('splitBox').hidden));
+  document.getElementById('splitApply').addEventListener('click', splitFromEditor);
+  document.getElementById('splitAmount').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); splitFromEditor(); }
+  });
   document.getElementById('editDelete').addEventListener('click', () => {
     const i = editIndex;
     closeEditor();
@@ -3395,6 +5074,12 @@
   // Table rows: click or Enter opens the editor; checkboxes select
   const tbodyEl = document.querySelector('#budgetTable tbody');
   tbodyEl.addEventListener('click', (e) => {
+    const chip = e.target.closest('.note-chip');
+    if (chip) {
+      searchInput.value = chip.dataset.note;
+      renderTable();
+      return;
+    }
     if (e.target.closest('button, input, a')) return;
     const tr = e.target.closest('tr.txn-row');
     if (tr) openEditor(Number(tr.dataset.index));
@@ -3419,10 +5104,91 @@
     renderTable();
   });
   document.getElementById('bulkApply').addEventListener('click', bulkSetCategory);
+  document.getElementById('bulkNoteApply').addEventListener('click', bulkSetNote);
+  document.getElementById('bulkNote').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); bulkSetNote(); } });
   document.getElementById('bulkDelete').addEventListener('click', bulkDelete);
   document.getElementById('bulkClear').addEventListener('click', () => {
     selectedRows.clear();
     renderTable();
+  });
+
+  // Clicking a top store or budget card filters the table to it
+  const openFromDashboard = (el) => {
+    if (el.dataset.store) filterTableTo({ search: el.dataset.store });
+    else if (el.dataset.target) {
+      const t = el.dataset.target;
+      const isCategory = getCategoryGroup(t) || Object.prototype.hasOwnProperty.call(getCategoryGroups(), t);
+      filterTableTo(isCategory ? { category: t } : { search: t });
+    }
+  };
+  ['dashTopStores', 'budgetProgressList'].forEach(id => {
+    const host = document.getElementById(id);
+    host.addEventListener('click', (e) => {
+      const el = e.target.closest('[data-store], [data-target]');
+      if (el) openFromDashboard(el);
+    });
+    host.addEventListener('keydown', (e) => {
+      const el = e.target.closest('[data-store], [data-target]');
+      if (el && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); openFromDashboard(el); }
+    });
+  });
+  document.getElementById('categoryChipClear').addEventListener('click', () => {
+    categoryFilter = '';
+    renderTable();
+  });
+
+  // Welcome screen shortcuts
+  document.getElementById('welcomeAdd').addEventListener('click', () => {
+    if (isPhone()) { openEntrySheet(); return; }
+    setCollapsed('entry', false);
+    document.getElementById('entryCard').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    setTimeout(() => document.getElementById('amount').focus({ preventScroll: true }), 250);
+  });
+  document.getElementById('welcomeOpen').addEventListener('click', chooseUploadFiles);
+
+  // ---- Collapsible sections (remembered on this device) ----
+  const COLLAPSE_KEY = 'spendwise_collapsed';
+  const COLLAPSE_TARGETS = { overview: '#overviewSection', entry: '#entryCard', table: '.table-section' };
+
+  function setCollapsed(key, collapsed, persist = true) {
+    const section = document.querySelector(COLLAPSE_TARGETS[key]);
+    const btn = document.querySelector(`[data-collapse="${key}"]`);
+    if (!section || !btn) return;
+    section.classList.toggle('collapsed', collapsed);
+    btn.setAttribute('aria-expanded', String(!collapsed));
+    btn.setAttribute('aria-label', `${collapsed ? 'Expand' : 'Collapse'} ${btn.getAttribute('aria-label').replace(/^(Expand|Collapse) /, '')}`);
+    if (!persist) return;
+    let state = {};
+    try { state = JSON.parse(localStorage.getItem(COLLAPSE_KEY)) || {}; } catch (e) { /* ignore */ }
+    state[key] = collapsed;
+    try { localStorage.setItem(COLLAPSE_KEY, JSON.stringify(state)); } catch (e) { /* ignore */ }
+  }
+
+  document.querySelectorAll('[data-collapse]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const key = btn.dataset.collapse;
+      setCollapsed(key, !document.querySelector(COLLAPSE_TARGETS[key]).classList.contains('collapsed'));
+    });
+  });
+  try {
+    const saved = JSON.parse(localStorage.getItem(COLLAPSE_KEY)) || {};
+    Object.keys(COLLAPSE_TARGETS).forEach(k => { if (saved[k] === true) setCollapsed(k, true, false); });
+  } catch (e) { /* ignore */ }
+
+  // Enter saves a category edit, Escape cancels it
+  document.getElementById('builtinCats').addEventListener('keydown', (e) => {
+    const row = e.target.closest('.cat-edit-row.editing');
+    if (!row) return;
+    if (e.key === 'Enter') { e.preventDefault(); saveCategoryEdit(row.dataset.cat); }
+    else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); editingCategory = null; renderBuiltinCategories(); }
+  });
+
+  document.getElementById('goalsList').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && e.target.matches('.goal-add input')) {
+      e.preventDefault();
+      const btn = e.target.closest('.goal-add').querySelector('[data-action="addToGoal"]');
+      addToGoal(btn.dataset.id, e.target);
+    }
   });
 
   // Draft restore bar
@@ -3451,7 +5217,8 @@
         if (!modal.contains(document.activeElement)) {
           setTimeout(() => {
             if (modal.contains(document.activeElement)) return;
-            const first = [...modal.querySelectorAll(FOCUSABLE)].find(el => el.offsetParent !== null);
+            const visible = [...modal.querySelectorAll(FOCUSABLE)].filter(el => el.offsetParent !== null);
+            const first = visible.find(el => !el.matches('.close, .back-btn')) || visible[0];
             if (first) first.focus();
           }, 60);
         }

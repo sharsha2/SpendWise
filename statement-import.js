@@ -226,7 +226,26 @@ if (typeof document !== 'undefined') {
     return pdfjsPromise;
   }
 
-  async function readPdfLines(file) {
+  // Toast with a progress bar that stays up until the import finishes
+  function showProgress(text, fraction) {
+    const box = document.getElementById('statusMessage');
+    clearTimeout(statusTimeout);
+    box.textContent = text;
+    const bar = document.createElement('div');
+    bar.className = 'status-progress';
+    bar.setAttribute('role', 'progressbar');
+    bar.setAttribute('aria-valuemin', '0');
+    bar.setAttribute('aria-valuemax', '100');
+    bar.setAttribute('aria-valuenow', String(Math.round(fraction * 100)));
+    const fill = document.createElement('span');
+    fill.style.width = `${Math.max(4, Math.round(fraction * 100))}%`;
+    bar.appendChild(fill);
+    box.appendChild(bar);
+    box.className = 'status-message status-success';
+    box.style.display = 'block';
+  }
+
+  async function readPdfLines(file, onPage) {
     const pdfjs = await loadPdfjs();
     const task = pdfjs.getDocument({
       data: new Uint8Array(await file.arrayBuffer()),
@@ -246,7 +265,9 @@ if (typeof document !== 'undefined') {
     const doc = await task.promise;
     const lines = [];
     try {
-      for (let i = 1; i <= Math.min(doc.numPages, 60); i++) {
+      const pages = Math.min(doc.numPages, 60);
+      for (let i = 1; i <= pages; i++) {
+        if (onPage) onPage(i, pages);
         const page = await doc.getPage(i);
         const content = await page.getTextContent();
         lines.push(...itemsToLines(content.items));
@@ -268,14 +289,16 @@ if (typeof document !== 'undefined') {
   async function importStatementFiles(files) {
     const list = [...files].filter(f => /\.pdf$/i.test(f.name) || f.type === 'application/pdf');
     if (!list.length) return;
-    showStatus('📄 Reading statement…');
     const rows = [];
     const problems = [];
     let bank = '';
-    for (const file of list) {
+    for (const [fi, file] of list.entries()) {
+      const label = list.length > 1 ? `📄 Statement ${fi + 1} of ${list.length}` : '📄 Reading statement';
+      showProgress(`${label}…`, fi / list.length);
       try {
         if (file.size > 25 * 1024 * 1024) throw new Error('file is larger than 25 MB');
-        const lines = await readPdfLines(file);
+        const lines = await readPdfLines(file, (page, pages) =>
+          showProgress(`${label} — page ${page} of ${pages}`, (fi + page / pages) / list.length));
         if (lines.join('').replace(/\s/g, '').length < 8) {
           throw new Error('no readable text — it looks like a scanned image');
         }
@@ -292,6 +315,7 @@ if (typeof document !== 'undefined') {
       showStatus(`❌ Couldn't import: ${problems.join('; ')}`, true);
       return;
     }
+    document.getElementById('statusMessage').style.display = 'none';
     importRows = rows;
     importSourceName = list.length === 1 ? list[0].name : `${list.length} statements`;
     openImportReview(matchSettingsBank(bank), problems);
@@ -334,7 +358,7 @@ if (typeof document !== 'undefined') {
   function renderImportRows() {
     const tbody = document.querySelector('#importTable tbody');
     tbody.innerHTML = importRows.map((r, i) => {
-      const cat = categorizeStore(r.description);
+      const cat = getCategory({ 'Purchased Store': r.description });
       const kind = classify(buildEntry(r, '', '')).kind;
       const tag = r.duplicate ? '<span class="kind-tag">Already in list</span>'
         : r.check ? '<span class="kind-tag check">Check type</span>'
@@ -387,6 +411,9 @@ if (typeof document !== 'undefined') {
       showStatus('↩️ Import undone.');
     });
   }
+
+  // The main Upload button (app.js) hands PDFs to this
+  window.importStatementFiles = importStatementFiles;
 
   const pdfInput = document.getElementById('pdfInput');
   pdfInput.addEventListener('change', () => {

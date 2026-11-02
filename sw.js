@@ -3,7 +3,7 @@
    the latest version (the reason caching used to be disabled). The cache is
    only used when there is no connection, so the app also works offline.
    Only the app's own files are cached; transactions are never stored here. */
-const CACHE = 'moneta-v3';
+const CACHE = 'moneta-v4';
 const APP_FILES = [
   './',
   'index.html',
