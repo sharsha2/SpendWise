@@ -220,6 +220,43 @@ t('e-transfer to a person still counts as spending', () =>
 t('manual Income category on a credit counts as income', () =>
   eq(classify({ 'Purchased Store': 'Sold bike', 'Category': 'Income', 'Credit [C]': 120 }).income, 12000));
 
+t('a tax refund is income, never negative spending (March 2026 bug)', () => {
+  const rows = [
+    { 'Purchased Store': 'Home Rent', 'Debit [D]': 2300 },
+    { 'Purchased Store': 'Tax Refund CRA', 'Credit [C]': 8277.03 },
+    { 'Purchased Store': 'Jonas Payroll', 'Credit [C]': 3514.32 }
+  ];
+  const p = periodTotals(rows);
+  eq(p.spent, 2300, 'spending unaffected');
+  eq(p.income, 11791.35, 'refund counted as income');
+  eq(classify({ 'Purchased Store': 'GST/HST credit', 'Credit [C]': 120 }).kind, 'income');
+  eq(classify({ 'Purchased Store': 'CRA', 'Category': 'Taxes & Fees', 'Credit [C]': 50 }).kind, 'income', 'any tax credit');
+  eq(classify({ 'Purchased Store': 'CRA balance owing', 'Debit [D]': 300 }).spend, 30000, 'paying tax is still spending');
+});
+
+t('a refund bigger than the month\'s spending in its category counts as income (Feb/Apr 2026)', () => {
+  const rows = markExcessRefunds([
+    { 'Date': '2026-02-03', 'Purchased Store': 'Mystery shop', 'Debit [D]': 55.85 },
+    { 'Date': '2026-02-10', 'Purchased Store': 'Chinnu Transfered', 'Credit [C]': 1359.60 },
+    { 'Date': '2026-02-12', 'Purchased Store': 'Amazon', 'Debit [D]': 80 },
+    { 'Date': '2026-02-20', 'Purchased Store': 'Amazon refund', 'Credit [C]': 30 }
+  ]);
+  const p = periodTotals(rows);
+  eq(p.spent, 105.85, 'spending: 55.85 + (80 − 30)');
+  eq(p.income, 1359.60, 'money received is income');
+  eq(classify(rows[3]).kind, 'refund', 'a normal refund still lowers spending');
+  eq(rows.every(r => classify(r).spend >= 0 || classify(r).kind === 'refund'), true);
+});
+
+t('the same refund in a different month is judged on that month', () => {
+  const rows = markExcessRefunds([
+    { 'Date': '2026-01-12', 'Purchased Store': 'Amazon', 'Debit [D]': 80 },
+    { 'Date': '2026-02-02', 'Purchased Store': 'Amazon refund', 'Credit [C]': 80 }
+  ]);
+  eq(classify(rows[1]).kind, 'income', 'nothing spent at Amazon in February');
+  eq(periodTotals(rows).spent, 80);
+});
+
 // ---- Duplicates ----
 t('duplicate check matches same date/store/amount, ignoring case and spaces', () => {
   const rows = [{ 'Date': '2026-11-01', 'Purchased Store': 'Costco', 'Debit [D]': 85 }];

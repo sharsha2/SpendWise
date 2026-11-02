@@ -305,7 +305,10 @@
   function defaultCategoryGroups() {
     return {
       'Income': {
-        'Income': ['payroll', 'salary', 'deposit', 'income', 'interest', 'intrest', 'cashback', 'rebate']
+        'Income': ['payroll', 'salary', 'deposit', 'income', 'interest', 'intrest', 'cashback', 'rebate',
+          // money back from the government is income, not a refund of spending
+          'tax refund', 'tax return', 'cra refund', 'gst credit', 'hst credit', 'gst/hst', 'climate action', 'carbon rebate',
+          'child benefit', 'ccb', 'canada fed', 'ei payment', 'cerb']
       },
       // Money moving between your own accounts — never counted as spending or income
       [TRANSFER_GROUP]: {
@@ -1169,7 +1172,7 @@
       showStatus(`❌ No transactions found${problems.length ? ': ' + problems.join(', ') : ''}`, true);
       return;
     }
-    yearRows = rows;
+    yearRows = markExcessRefunds(rows);
     yearFileNames = files.map(f => f.name).filter(n => !problems.some(p => p.startsWith(n)));
     // Default to the year most of the rows belong to
     const counts = {};
@@ -2623,6 +2626,7 @@
   let tableViewKey = '';
 
   function renderTable() {
+    markExcessRefunds(budgetData);
     const table = document.getElementById('budgetTable');
     const tbody = table.querySelector('tbody');
     const tfoot = table.querySelector('tfoot');
@@ -3486,7 +3490,7 @@
             const data = new Uint8Array(e.target.result);
             const workbook = XLSX.read(data, { type: 'array' });
 
-            readWorkbookRows(workbook).rows.forEach(row => {
+            markExcessRefunds(readWorkbookRows(workbook).rows).forEach(row => {
               if (row['Date']) {
                 const parts = row['Date'].split('-');
                 if (parts.length >= 2) {
@@ -3615,12 +3619,41 @@
   //  - Transfers & Savings (card payments, own-account moves, investing) count as neither
   //  - Income-category credits are income
   //  - everything else is spending; a credit there is a refund and lowers spending
+  // Refunds bigger than what was spent in their category that month are really
+  // money coming in (a transfer from someone, an insurance payout…). Set by
+  // markExcessRefunds() for each data set, so no category goes below zero.
+  const EXCESS_REFUNDS = new WeakSet();
+
+  function markExcessRefunds(rows) {
+    const buckets = new Map();
+    rows.forEach(r => {
+      EXCESS_REFUNDS.delete(r);
+      const c = classify(r);
+      if (c.kind !== 'expense' && c.kind !== 'refund') return;
+      const key = `${monthKeyOf(r) || 'undated'}|${getCategory(r)}`;
+      const b = buckets.get(key) || { spent: 0, refunded: 0, refunds: [] };
+      if (c.spend > 0) b.spent += c.spend;
+      else { b.refunded -= c.spend; b.refunds.push(r); }
+      buckets.set(key, b);
+    });
+    buckets.forEach(b => {
+      if (b.refunded > b.spent) b.refunds.forEach(r => EXCESS_REFUNDS.add(r));
+    });
+    return rows;
+  }
+
   function classify(row) {
     const debit = toCents(row['Debit [D]']);
     const credit = toCents(row['Credit [C]']);
+    if (EXCESS_REFUNDS.has(row)) return { spend: 0, income: credit - debit, transfer: 0, kind: 'income' };
     const group = getCategoryGroup(getCategory(row));
     if (group === TRANSFER_GROUP) return { spend: 0, income: 0, transfer: credit - debit, kind: 'transfer' };
     if (group === 'Income') return { spend: 0, income: credit - debit, transfer: 0, kind: 'income' };
+    // Money coming back for taxes or fees (CRA refunds, credits) is income — a
+    // large one would otherwise push spending below zero
+    if (credit > debit && getCategory(row) === canonicalCategory('Taxes & Fees')) {
+      return { spend: 0, income: credit - debit, transfer: 0, kind: 'income' };
+    }
     return { spend: debit - credit, income: 0, transfer: 0, kind: credit > debit ? 'refund' : 'expense' };
   }
 
