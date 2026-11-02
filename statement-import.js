@@ -548,6 +548,16 @@ if (typeof document !== 'undefined') {
   // The main Upload button (app.js) hands PDFs to this
   window.importStatementFiles = importStatementFiles;
 
+  // Compare months and Year summary read PDFs through this: a Moneta report or a
+  // bank statement becomes rows in the same shape as an Excel file
+  window.readStatementRows = async function (file) {
+    if (file.size > 25 * 1024 * 1024) throw new Error('larger than 25 MB');
+    const lines = await readPdfLines(file);
+    if (lines.map(l => l.text).join('').replace(/\s/g, '').length < 8) throw new Error('no readable text');
+    const result = parseMonetaReport(lines) || parseStatementLines(lines);
+    return result.transactions.map(t => normalizeRow(buildEntry(t, '', '')));
+  };
+
   const pdfInput = document.getElementById('pdfInput');
   pdfInput.addEventListener('change', () => {
     // Copy first: clearing the input also empties its live FileList

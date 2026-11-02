@@ -2,6 +2,8 @@
   let editIndex = -1;              // row open in the edit dialog
   const selectedRows = new Set();  // rows ticked for bulk actions
   let unsavedCount = 0;            // changes since the last open/save
+  let sampleMode = false;          // sample data on screen: never saved as a draft
+  const SAMPLE_SAVE_MESSAGE = "ℹ️ This is sample data, so it can't be saved. Upload your own Excel file or bank PDF to save.";
   // The file the data came from: { name, months, handle, workbook }.
   // Saving writes its months back into it; other months get their own files.
   let source = null;
@@ -855,13 +857,66 @@
     location.reload();
   }
 
-  function toggleTheme() {
+  // ---- Motion helpers ----
+  const prefersReducedMotion = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  // Runs a DOM change as a View Transition where the browser supports it
+  function withViewTransition(update, className) {
+    if (!document.startViewTransition || prefersReducedMotion()) { update(); return; }
+    if (className) document.documentElement.classList.add(className);
+    const t = document.startViewTransition(update);
+    t.finished.finally(() => { if (className) document.documentElement.classList.remove(className); });
+  }
+
+  // A number glides to its new value — only when the value really changed
+  function setAnimatedNumber(el, value, format) {
+    const from = typeof el._value === 'number' ? el._value : null;
+    el._value = value;
+    if (from === null || from === value || prefersReducedMotion() || document.hidden) {
+      el.textContent = format(value);
+      return;
+    }
+    const start = performance.now();
+    const duration = 560;
+    cancelAnimationFrame(el._raf);
+    const step = now => {
+      const t = Math.min(1, (now - start) / duration);
+      const eased = 1 - Math.pow(1 - t, 4);
+      el.textContent = format(from + (value - from) * eased);
+      if (t < 1) el._raf = requestAnimationFrame(step);
+      else el.textContent = format(value);
+    };
+    el._raf = requestAnimationFrame(step);
+  }
+
+  // New data arrived: the dashboard settles in, tiles first then panels
+  function revealDashboard() {
+    if (prefersReducedMotion()) return;
+    const section = document.getElementById('overviewSection');
+    [...section.querySelectorAll('.kpi'), ...section.querySelectorAll('.dash-panel:not([hidden])')]
+      .forEach((el, i) => el.style.setProperty('--i', String(i)));
+    section.classList.remove('revealing');
+    void section.offsetWidth; // restart the animation
+    section.classList.add('revealing');
+    clearTimeout(section._revealTimer);
+    section._revealTimer = setTimeout(() => section.classList.remove('revealing'), 1400);
+  }
+
+  function toggleTheme(origin) {
     const currentTheme = document.documentElement.getAttribute('data-theme');
     const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
-    document.documentElement.setAttribute('data-theme', newTheme);
-    localStorage.setItem('spendwise_theme', newTheme);
-    updateThemeUI(newTheme);
-    renderDashboard();
+    // The new theme spreads out from the button that was pressed
+    if (origin && origin.getBoundingClientRect) {
+      const r = origin.getBoundingClientRect();
+      document.documentElement.style.setProperty('--vt-x', `${r.left + r.width / 2}px`);
+      document.documentElement.style.setProperty('--vt-y', `${r.top + r.height / 2}px`);
+    }
+    withViewTransition(() => {
+      document.documentElement.setAttribute('data-theme', newTheme);
+      localStorage.setItem('spendwise_theme', newTheme);
+      updateThemeUI(newTheme);
+      renderDashboard();
+    }, 'theme-transition');
   }
 
   function updateThemeUI(theme) {
@@ -993,6 +1048,10 @@
   }
 
   setupMenu('downloadBtn', 'saveMenu', () => {
+    // Sample data: both options stay visible but explain why they're unavailable
+    document.getElementById('saveMenu').classList.toggle('is-sample', sampleMode);
+    ['saveExcelItem', 'savePdfItem'].forEach(id => document.getElementById(id).setAttribute('aria-disabled', String(sampleMode)));
+    document.getElementById('saveSampleHint').hidden = !sampleMode;
     const month = reportMonth();
     document.getElementById('savePdfHint').textContent = month
       ? `Summary of ${monthLabelOf(month, { month: 'long', year: 'numeric' })} to keep or share`
@@ -1030,7 +1089,38 @@
 
   // Typing dates manually means the preset no longer describes the range
   [filterStartDate, filterEndDate].forEach(el =>
-    el.addEventListener('input', () => { datePreset.value = 'custom'; }));
+    el.addEventListener('input', () => { datePreset.value = 'custom'; syncFilterUI(); }));
+
+  // Filters panel: date chips drive the preset; the button shows how many are on
+  const filterPanel = document.getElementById('filterPanel');
+  const filtersToggle = document.getElementById('filtersToggle');
+  function setFilterPanel(open) {
+    filterPanel.hidden = !open;
+    filtersToggle.setAttribute('aria-expanded', String(open));
+  }
+  filtersToggle.addEventListener('click', () => setFilterPanel(filterPanel.hidden));
+  filterPanel.querySelectorAll('[data-preset]').forEach(chip => chip.addEventListener('click', () => {
+    datePreset.value = chip.dataset.preset;
+    if (chip.dataset.preset === 'custom') { syncFilterUI(); filterStartDate.focus(); return; }
+    datePreset.dispatchEvent(new Event('change'));
+  }));
+
+  function activeFilterCount() {
+    return (filterStartDate.value || filterEndDate.value ? 1 : 0) +
+      (filterMinAmount.value !== '' || filterMaxAmount.value !== '' ? 1 : 0);
+  }
+
+  function syncFilterUI() {
+    const n = activeFilterCount();
+    const badge = document.getElementById('filterCount');
+    badge.hidden = n === 0;
+    badge.textContent = String(n);
+    filtersToggle.classList.toggle('has-filters', n > 0);
+    filterPanel.querySelectorAll('[data-preset]').forEach(chip =>
+      chip.classList.toggle('active', chip.dataset.preset === datePreset.value));
+    // A filter set from the dashboard opens the panel so it can be seen and changed
+    if (n > 0 && filterPanel.hidden && syncFilterUI.autoOpen) setFilterPanel(true);
+  }
 
   function applyRecurringTransactions() {
     const settings = getSettings();
@@ -1141,21 +1231,29 @@
     document.getElementById('yearModal').style.display = 'flex';
   }
 
-  // Reads every chosen file; a transaction already seen in an earlier file
-  // (e.g. two overlapping exports) is counted once
-  async function loadYearFiles(fileList) {
-    const files = [...fileList].sort((a, b) => a.name.localeCompare(b.name));
-    if (!files.length) return;
-    if (typeof XLSX === 'undefined') { showStatus('❌ Excel library not loaded. Please refresh.', true); return; }
+  // Rows from one file of either kind: Excel (every transaction sheet) or PDF
+  // (bank statement or Moneta report)
+  async function rowsFromFile(file) {
+    if (/\.pdf$/i.test(file.name) || file.type === 'application/pdf') {
+      if (typeof window.readStatementRows !== 'function') throw new Error('PDF reader not loaded');
+      return window.readStatementRows(file);
+    }
+    if (typeof XLSX === 'undefined') throw new Error('Excel library not loaded');
+    if (file.size > 20 * 1024 * 1024) throw new Error('larger than 20 MB');
+    return readWorkbookRows(XLSX.read(new Uint8Array(await file.arrayBuffer()), { type: 'array' })).rows;
+  }
+
+  // Several files at once. A transaction already seen in an earlier file (an
+  // Excel file and a PDF of the same month, overlapping exports) counts once.
+  async function rowsFromFiles(files) {
     const rows = [];
     const seenBefore = new Set();
     const problems = [];
+    const used = [];
     let skipped = 0;
     for (const file of files) {
       try {
-        if (file.size > 20 * 1024 * 1024) throw new Error('larger than 20 MB');
-        const wb = XLSX.read(new Uint8Array(await file.arrayBuffer()), { type: 'array' });
-        const fileRows = readWorkbookRows(wb).rows;
+        const fileRows = await rowsFromFile(file);
         const keysHere = new Set();
         fileRows.forEach(r => {
           const k = dupKey(r);
@@ -1164,16 +1262,27 @@
           rows.push(r);
         });
         keysHere.forEach(k => seenBefore.add(k));
+        used.push(file.name);
       } catch (e) {
         problems.push(`${file.name} (${e.message})`);
       }
     }
+    return { rows, skipped, problems, used };
+  }
+
+  // Reads every chosen file; a transaction already seen in an earlier file
+  // (e.g. two overlapping exports) is counted once
+  async function loadYearFiles(fileList) {
+    const files = [...fileList].sort((a, b) => a.name.localeCompare(b.name));
+    if (!files.length) return;
+    showStatus(`📂 Reading ${files.length} file${files.length === 1 ? '' : 's'}…`);
+    const { rows, skipped, problems, used } = await rowsFromFiles(files);
     if (!rows.length) {
       showStatus(`❌ No transactions found${problems.length ? ': ' + problems.join(', ') : ''}`, true);
       return;
     }
     yearRows = markExcessRefunds(rows);
-    yearFileNames = files.map(f => f.name).filter(n => !problems.some(p => p.startsWith(n)));
+    yearFileNames = used;
     // Default to the year most of the rows belong to
     const counts = {};
     rows.forEach(r => { const k = monthKeyOf(r); if (k) counts[k.slice(0, 4)] = (counts[k.slice(0, 4)] || 0) + 1; });
@@ -1706,6 +1815,7 @@
   }
 
   function downloadMonthPdf() {
+    if (sampleMode) { showStatus(SAMPLE_SAVE_MESSAGE); return; }
     const month = reportMonth();
     if (!month) {
       showStatus('⚠️ Add or open transactions first — the report needs a month with data.', true);
@@ -2070,6 +2180,27 @@
         `<button type="button" class="pill-btn ghost" data-action="mergeSuggestion" data-index="${i}" data-keep="b">Use “${escapeHtml(p.b.name)}”</button>` +
         `<button type="button" class="pill-btn ghost" data-action="notSameSuggestion" data-index="${i}">Not the same</button>` +
         `</span></div>`).join('');
+  }
+
+  // Quick category chips: your most-used categories, one tap each
+  const QUICK_DEFAULTS = ['Groceries', 'Dining', 'Gas', 'Shopping', 'Bills', 'Rent'];
+  function renderQuickCats() {
+    const host = document.getElementById('quickCats');
+    if (!host) return;
+    const counts = {};
+    budgetData.forEach(r => {
+      if (classify(r).kind !== 'expense') return;
+      const c = getCategory(r);
+      if (c && c !== 'Other') counts[c] = (counts[c] || 0) + 1;
+    });
+    const valid = new Set(allCategoryNames());
+    const picks = Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([c]) => c);
+    QUICK_DEFAULTS.map(canonicalCategory).forEach(c => { if (!picks.includes(c)) picks.push(c); });
+    const shown = picks.filter(c => valid.has(c)).slice(0, 6);
+    const current = document.getElementById('category').value;
+    host.innerHTML = shown.map(c =>
+      `<button type="button" class="chip quick-cat${c === current ? ' active' : ''}" data-cat="${escapeHtml(c)}" aria-pressed="${c === current}">${escapeHtml(c)}</button>`).join('') +
+      '<button type="button" class="chip quick-more" id="quickMore">More…</button>';
   }
 
   // Notes you've used before, newest first, offered while typing a note
@@ -2634,6 +2765,7 @@
     const filteredData = getFilteredData();
     const filtersActive = searchInput.value !== '' || filterStartDate.value || filterEndDate.value ||
       filterMinAmount.value !== '' || filterMaxAmount.value !== '' || !!categoryFilter;
+    syncFilterUI();
     const chip = document.getElementById('categoryChip');
     chip.hidden = !categoryFilter;
     document.getElementById('categoryChipLabel').textContent = categoryFilter;
@@ -2646,6 +2778,7 @@
     [...selectedRows].forEach(r => { if (!live.has(r)) selectedRows.delete(r); });
     updateBulkBar(filteredData);
     refreshNoteSuggestions();
+    renderQuickCats();
 
     if (filteredData.length === 0) {
       table.classList.remove('grouped');
@@ -3034,6 +3167,7 @@
   // Unsaved work is kept on this device only (never sent anywhere), so a
   // refresh or closed tab can't lose it. Cleared once the data is saved.
   function persistDraft() {
+    if (sampleMode) return; // sample data is never kept
     try {
       if (unsavedCount > 0 && budgetData.length) {
         localStorage.setItem(DRAFT_KEY, JSON.stringify({
@@ -3051,7 +3185,7 @@
 
   function updateUnsavedBadge() {
     const badge = document.getElementById('unsavedBadge');
-    badge.hidden = unsavedCount === 0;
+    badge.hidden = unsavedCount === 0 || sampleMode;
     badge.textContent = unsavedCount > 99 ? '99+' : String(unsavedCount);
     document.getElementById('downloadBtn').setAttribute('aria-label', unsavedCount
       ? `Save to Excel, ${unsavedCount} unsaved change${unsavedCount === 1 ? '' : 's'}`
@@ -3105,8 +3239,10 @@
     selectedRows.clear();
     dashPinned = null;
     unsavedCount = 0;
+    leaveSampleMode();
     markChanged(Math.max(1, parseInt(draft.unsaved, 10) || 1));
     renderTable();
+    revealDashboard();
     showStatus(`↩️ Restored ${budgetData.length} transactions. Save when you're ready.`);
   }
 
@@ -3209,6 +3345,7 @@
   }
 
   async function downloadExcel() {
+    if (sampleMode) { showStatus(SAMPLE_SAVE_MESSAGE); return; }
     if (budgetData.length === 0) {
       showStatus('❌ No data to save yet.', true);
       return;
@@ -3443,6 +3580,7 @@
         return false;
       }
       budgetData = read.rows;
+      leaveSampleMode();
       rememberStores(budgetData);
       source = {
         name: file.name,
@@ -3459,6 +3597,7 @@
       document.getElementById('draftBanner').hidden = true;
       markSaved();
       renderTable();
+      revealDashboard();
       const dups = countDuplicates(budgetData);
       showStatus(`✅ Opened ${budgetData.length} transaction${budgetData.length > 1 ? 's' : ''} from ${file.name}` +
         (read.sheets.length > 1 ? ` (${read.sheets.length} sheets)` : '') +
@@ -3471,6 +3610,8 @@
     }
   }
 
+  let compareNote = '';
+
   async function uploadMultipleExcel(event) {
     // Copy first: clearing the input (so the same files can be picked again) empties its FileList
     const files = [...(event.target.files || [])];
@@ -3482,40 +3623,20 @@
     let grandTotalExpense = 0;
     document.getElementById('comparisonSummary').style.display = 'none';
 
-    const filePromises = Array.from(files).map(file => {
-      return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          try {
-            const data = new Uint8Array(e.target.result);
-            const workbook = XLSX.read(data, { type: 'array' });
-
-            markExcessRefunds(readWorkbookRows(workbook).rows).forEach(row => {
-              if (row['Date']) {
-                const parts = row['Date'].split('-');
-                if (parts.length >= 2) {
-                  const sortKey = `${parts[0]}-${parts[1]}`;
-                  if (!allMonthlyData[sortKey]) {
-                    const displayDate = new Date(parts[0], parts[1] - 1, 1);
-                    const label = displayDate.toLocaleString('default', { month: 'short', year: 'numeric' });
-                    allMonthlyData[sortKey] = { label, income: 0, expenses: 0 };
-                  }
-                  const c = classify(row);
-                  allMonthlyData[sortKey].income += c.income;
-                  allMonthlyData[sortKey].expenses += c.spend;
-                }
-              }
-            });
-            resolve();
-          } catch (err) { reject(err); }
-        };
-        reader.onerror = reject;
-        reader.readAsArrayBuffer(file);
-      });
-    });
-
     try {
-      await Promise.all(filePromises);
+      showStatus(`📂 Reading ${files.length} file${files.length === 1 ? '' : 's'}…`);
+      const { rows, skipped, problems } = await rowsFromFiles(files);
+      if (!rows.length) throw new Error(problems.length ? problems.join(', ') : 'no transactions found');
+      markExcessRefunds(rows).forEach(row => {
+        const key = monthKeyOf(row);
+        if (!key) return;
+        if (!allMonthlyData[key]) allMonthlyData[key] = { label: monthLabelOf(key), income: 0, expenses: 0 };
+        const c = classify(row);
+        allMonthlyData[key].income += c.income;
+        allMonthlyData[key].expenses += c.spend;
+      });
+      compareNote = [skipped ? `${skipped} duplicate${skipped === 1 ? '' : 's'} counted once` : '',
+        problems.length ? `couldn't read ${problems.join(', ')}` : ''].filter(Boolean).join(' · ');
 
       Object.values(allMonthlyData).forEach(m => {
         grandTotalIncome += m.income;   // still in cents here
@@ -3530,7 +3651,8 @@
       document.getElementById('comparisonSummary').style.display = 'grid';
 
       updateCompareMonthsChart(allMonthlyData);
-      showStatus(`✅ Successfully processed ${files.length} files for comparison.`);
+      showStatus(`✅ Compared ${Object.keys(allMonthlyData).length} month${Object.keys(allMonthlyData).length === 1 ? '' : 's'} from ${files.length} file${files.length === 1 ? '' : 's'}` +
+        (compareNote ? ` · ${compareNote}` : ''));
     } catch (error) {
       showStatus('❌ Error processing comparison files: ' + error.message, true);
     }
@@ -3972,7 +4094,9 @@
     const cutoff = isMonth && dashActive === todayStr().slice(0, 7) ? monthCutoffDay(rows) : null;
     const prevCompare = cutoff ? prevRows.filter(r => dayOf(r) <= cutoff) : prevRows;
     const prevLabel = prevKey ? monthLabelOf(prevKey, { month: 'short' }) + (cutoff ? ` 1–${cutoff}` : '') : '';
-    renderKpis(rows, prevRows.length ? prevCompare : null, prevLabel);
+    // On the 1st and 2nd there's too little to compare — show no change arrows yet
+    const tooEarly = cutoff !== null && cutoff < 3;
+    renderKpis(rows, prevRows.length && !tooEarly ? prevCompare : null, prevLabel);
 
     const empty = budgetData.length === 0;
     document.getElementById('dashEmpty').hidden = !empty;
@@ -4151,10 +4275,10 @@
     const cur = periodTotals(rows);
     const prev = prevRows ? periodTotals(prevRows) : null;
 
-    document.getElementById('kpiSpent').textContent = fmtMoney(cur.spent);
-    document.getElementById('kpiIncome').textContent = fmtMoney(cur.income);
+    setAnimatedNumber(document.getElementById('kpiSpent'), cur.spent, fmtMoney);
+    setAnimatedNumber(document.getElementById('kpiIncome'), cur.income, fmtMoney);
     const netEl = document.getElementById('kpiNet');
-    netEl.textContent = fmtMoney(cur.net);
+    setAnimatedNumber(netEl, cur.net, fmtMoney);
     netEl.classList.toggle('pos', cur.net > 0);
     netEl.classList.toggle('neg', cur.net < 0);
     document.getElementById('kpiRate').textContent = cur.rate === null ? '—' : `${cur.rate.toFixed(0)}%`;
@@ -4205,6 +4329,8 @@
       : 'No spending in this period';
 
     if (dashCategoryChart) dashCategoryChart.destroy();
+    // Height follows the number of bars, so one or two categories don't leave an empty box
+    document.getElementById('dashCategoryChart').parentElement.style.height = `${Math.max(96, top.length * 34 + 24)}px`;
     dashCategoryChart = new Chart(document.getElementById('dashCategoryChart'), {
       type: 'bar',
       plugins: [barValuePlugin],
@@ -4417,6 +4543,8 @@
 
   // Dashboard → table: show the matching transactions for the month on screen
   function filterTableTo({ category = '', search = '' }) {
+    syncFilterUI.autoOpen = true;
+    setTimeout(() => { syncFilterUI.autoOpen = false; }, 0);
     categoryFilter = category;
     searchInput.value = search;
     filterMinAmount.value = '';
@@ -4438,9 +4566,11 @@
 
   const dashPeriodSelect = document.getElementById('dashPeriod');
   function setDashPeriod(value) {
-    dashPinned = value;
-    renderDashboard();
-    renderBudgetTracking();
+    withViewTransition(() => {
+      dashPinned = value;
+      renderDashboard();
+      renderBudgetTracking();
+    });
   }
   dashPeriodSelect.addEventListener('change', () => setDashPeriod(dashPeriodSelect.value));
   // Prev = older month, Next = newer (the list is newest first)
@@ -5009,7 +5139,7 @@
     openReportsHub: () => openReportsHub(),
     openSettingsModal: () => openSettingsModal(),
     openCompareModal: () => openCompareModal(),
-    toggleTheme: () => toggleTheme(),
+    toggleTheme: el => toggleTheme(el),
     addSettingItem: el => addSettingItem(el.dataset.key, el.dataset.input),
     removeSettingItem: el => removeSettingItem(el.dataset.key, Number(el.dataset.index)),
     addBudgetSetting: () => addBudgetSetting(),
@@ -5170,6 +5300,78 @@
     renderTable();
   });
 
+  // ---- Sample data: see the whole app before committing a file ----
+  function buildSampleData() {
+    const settings = getSettings();
+    const [a, b] = settings.people.length >= 2 ? settings.people : ['Alex', 'Sam'];
+    const card = settings.banks.find(x => /amex|credit|visa/i.test(x)) || settings.banks[0] || 'Card';
+    const debitAcct = settings.banks.find(x => /debit|chequing/i.test(x)) || settings.banks[1] || card;
+    const today = todayStr();
+    const rows = [];
+    const add = (month, day, who, store, bank, debit, credit, note) => {
+      const [y, m] = month.split('-').map(Number);
+      const d = Math.min(day, new Date(y, m, 0).getDate());
+      const date = `${month}-${String(d).padStart(2, '0')}`;
+      if (date > today) return; // nothing in the future
+      const row = { 'Date': date, 'Purchased By': who, 'Purchased Store': store, 'Bank Name': bank,
+        'Debit [D]': debit || '', 'Credit [C]': credit || '', 'Amount Total': debit || credit };
+      if (note) row['Notes'] = note;
+      rows.push(row);
+    };
+    [shiftMonth(today.slice(0, 7), -2), shiftMonth(today.slice(0, 7), -1), today.slice(0, 7)].forEach((m, k) => {
+      add(m, 1, a, 'Payroll', debitAcct, 0, 4250);
+      add(m, 1, b, 'Payroll', debitAcct, 0, 3380);
+      add(m, 1, a, 'Rent', debitAcct, 2150, 0);
+      add(m, 3, b, 'Costco', card, 186.4 + k * 12.35, 0);
+      add(m, 5, a, 'Netflix', card, 16.99, 0);
+      add(m, 6, b, 'Rogers', card, 95, 0);
+      add(m, 8, a, 'Tim Hortons', card, 8.75 + k, 0);
+      add(m, 10, b, 'Shell', card, 64.2, 0);
+      add(m, 12, a, 'Uber Eats', card, 41.3 + k * 6, 0);
+      add(m, 14, b, 'No Frills', card, 92.15, 0);
+      add(m, 15, a, 'Amex credit card payment', debitAcct, 900, 0);
+      add(m, 18, b, 'Winners', card, 58.99 - k * 7, 0);
+      add(m, 20, a, 'Hydro One', debitAcct, 84.6, 0);
+      add(m, 22, b, 'GoodLife Fitness', card, 45, 0);
+      add(m, 24, a, 'TFSA contribution', debitAcct, 500, 0);
+      add(m, 26, b, 'Shoppers Drug Mart', card, 27.4, 0);
+    });
+    add(shiftMonth(today.slice(0, 7), -1), 9, a, 'Air Canada', card, 642, 0, 'Banff trip');
+    add(shiftMonth(today.slice(0, 7), -1), 11, b, 'Fairmont Banff Springs', card, 389, 0, 'Banff trip');
+    return rows.map(normalizeRow);
+  }
+
+  function loadSampleData() {
+    if (!confirmReplaceUnsaved()) return;
+    budgetData = buildSampleData();
+    sampleMode = true;
+    source = null;
+    selectedRows.clear();
+    dashPinned = null;
+    unsavedCount = 0;
+    updateUnsavedBadge();
+    document.getElementById('sampleBanner').hidden = false;
+    renderTable();
+    window.scrollTo({ top: 0, behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
+    revealDashboard();
+  }
+
+  function leaveSampleMode() {
+    sampleMode = false;
+    document.getElementById('sampleBanner').hidden = true;
+    updateUnsavedBadge();
+  }
+
+  document.getElementById('welcomeSample').addEventListener('click', loadSampleData);
+  document.getElementById('sampleClear').addEventListener('click', () => {
+    budgetData = [];
+    leaveSampleMode();
+    unsavedCount = 0;
+    updateUnsavedBadge();
+    renderTable();
+  });
+  document.getElementById('sampleUpload').addEventListener('click', () => chooseUploadFiles());
+
   // Welcome screen shortcuts
   document.getElementById('welcomeAdd').addEventListener('click', () => {
     if (isPhone()) { openEntrySheet(); return; }
@@ -5224,13 +5426,100 @@
     }
   });
 
+  // Quick category chips: tap to choose, tap again for Auto-detect
+  document.getElementById('quickCats').addEventListener('click', (e) => {
+    const chip = e.target.closest('button');
+    if (!chip) return;
+    e.preventDefault();
+    const sel = document.getElementById('category');
+    if (chip.id === 'quickMore') { openCategoryPanel(document.querySelector('#entryCard .cat-wrap')); return; }
+    sel.value = sel.value === chip.dataset.cat ? '' : chip.dataset.cat;
+    sel.dispatchEvent(new Event('change'));
+    renderQuickCats();
+  });
+  document.getElementById('category').addEventListener('change', renderQuickCats);
+
+  // ---- Phone tab bar ----
+  const tabActions = {
+    overview: () => document.getElementById('overviewSection').scrollIntoView({ behavior: prefersReducedMotion() ? 'auto' : 'smooth', block: 'start' }),
+    table: () => document.querySelector('.table-section').scrollIntoView({ behavior: prefersReducedMotion() ? 'auto' : 'smooth', block: 'start' }),
+    reports: () => openReportsHub(),
+    settings: () => openSettingsModal()
+  };
+  document.getElementById('tabBar').addEventListener('click', (e) => {
+    const tab = e.target.closest('.tab');
+    if (!tab) return;
+    if (tab.id === 'tabAdd') { openEntrySheet(); return; }
+    tabActions[tab.dataset.tab]();
+  });
+  // Highlight the section on screen
+  if ('IntersectionObserver' in window) {
+    const tabs = { overview: document.getElementById('overviewSection'), table: document.querySelector('.table-section') };
+    const io = new IntersectionObserver(entries => {
+      entries.forEach(en => {
+        if (!en.isIntersecting) return;
+        const key = Object.keys(tabs).find(k => tabs[k] === en.target);
+        document.querySelectorAll('#tabBar .tab[data-tab]').forEach(t => {
+          const on = t.dataset.tab === key;
+          t.classList.toggle('active', on);
+          if (on) t.setAttribute('aria-current', 'true'); else t.removeAttribute('aria-current');
+        });
+      });
+    }, { rootMargin: '-45% 0px -50% 0px' });
+    Object.values(tabs).forEach(el => io.observe(el));
+  }
+
+  // ---- Settings section menu ----
+  document.querySelector('.settings-nav').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-target]');
+    if (!btn) return;
+    document.getElementById(btn.dataset.target).scrollIntoView({ behavior: prefersReducedMotion() ? 'auto' : 'smooth', block: 'start' });
+  });
+
+  // ---- Keyboard shortcuts ----
+  const shortcutsModal = document.getElementById('shortcutsModal');
+  const openShortcuts = () => { shortcutsModal.style.display = 'flex'; };
+  document.getElementById('shortcutsLink').addEventListener('click', openShortcuts);
+  document.getElementById('closeShortcuts').addEventListener('click', () => { shortcutsModal.style.display = 'none'; });
+  shortcutsModal.addEventListener('click', (e) => { if (e.target === shortcutsModal) shortcutsModal.style.display = 'none'; });
+
+  document.addEventListener('keydown', (e) => {
+    // ⌘S / Ctrl+S saves to Excel from anywhere, instead of saving the web page
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === 's') {
+      e.preventDefault();
+      if (budgetData.length) downloadExcel();
+      return;
+    }
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    const typing = e.target.closest && e.target.closest('input, textarea, select, [contenteditable="true"]');
+    if (typing || [...document.querySelectorAll('.modal')].some(m => m.style.display === 'flex')) return;
+    if (e.key === 'n' || e.key === 'N') {
+      e.preventDefault();
+      if (isPhone()) { openEntrySheet(); return; }
+      setCollapsed('entry', false);
+      document.getElementById('entryCard').scrollIntoView({ behavior: prefersReducedMotion() ? 'auto' : 'smooth', block: 'center' });
+      setTimeout(() => document.getElementById('amount').focus({ preventScroll: true }), 200);
+    } else if (e.key === '/') {
+      e.preventDefault();
+      setCollapsed('table', false);
+      searchInput.scrollIntoView({ block: 'center' });
+      searchInput.focus({ preventScroll: true });
+    } else if (e.key === 's' || e.key === 'S') {
+      e.preventDefault();
+      document.getElementById('downloadBtn').click();
+    } else if (e.key === '?') {
+      e.preventDefault();
+      openShortcuts();
+    }
+  });
+
   // Draft restore bar
   document.getElementById('draftRestore').addEventListener('click', restoreDraft);
   document.getElementById('draftDiscard').addEventListener('click', discardDraft);
 
   // Last line of defence if storage is unavailable: warn before leaving with unsaved work
   window.addEventListener('beforeunload', (e) => {
-    if (unsavedCount > 0) {
+    if (unsavedCount > 0 && !sampleMode) {
       e.preventDefault();
       e.returnValue = '';
     }
@@ -5307,6 +5596,15 @@
   document.querySelectorAll('.action-btn[data-tooltip]').forEach(btn => {
     if (!btn.hasAttribute('aria-label')) btn.setAttribute('aria-label', btn.dataset.tooltip);
   });
+
+  // First impression: the header and hero arrive in a calm sequence, once per visit
+  try {
+    if (!sessionStorage.getItem('moneta_entered') && !prefersReducedMotion()) {
+      document.body.classList.add('is-entering');
+      setTimeout(() => document.body.classList.remove('is-entering'), 1800);
+    }
+    sessionStorage.setItem('moneta_entered', '1');
+  } catch (e) { /* storage unavailable */ }
 
   applyLastUsed();
   updateUnsavedBadge();

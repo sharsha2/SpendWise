@@ -149,10 +149,31 @@ const server = http.createServer((req, res) => {
   await menu('toggleTheme'); await sleep(120);
   ok('theme toggles', await p.evaluate(() => document.documentElement.getAttribute('data-theme')) !== theme0);
   await p.evaluate(() => { document.documentElement.setAttribute('data-theme', 'light'); updateThemeUI('light'); });
+  await sleep(700); // let the theme transition finish (the page ignores clicks during it)
 
   ok('welcome screen on a blank start', await vis('#dashEmpty') && !(await vis('#overviewSection .kpi-grid')));
 
   ok('one Upload button (no separate Excel/PDF buttons)', await vis('#uploadBtn') && !(await p.$('#uploadMenu')));
+
+  // Hero: one clear primary action, a secondary, the sample-data way in, and the privacy promise
+  ok('hero offers upload, add and sample data', await vis('#welcomeOpen') && await vis('#welcomeAdd') && await vis('#welcomeSample') && /Stays on this device/.test(await text('#dashEmpty') || ''));
+  await tap('#welcomeSample');
+  await p.waitForFunction(() => scrollY === 0 && budgetData.length > 0, { timeout: 5000 }).catch(() => {});
+  await sleep(300);
+  const sampleState = await p.evaluate(() => ({ n: budgetData.length, banner: !document.getElementById('sampleBanner').hidden, kpis: getComputedStyle(document.querySelector('#overviewSection .kpi-grid')).display }));
+  ok('sample data fills the dashboard', sampleState.n > 20 && sampleState.banner && sampleState.kpis !== 'none', JSON.stringify(sampleState));
+  ok('sample data is never saved as a draft', await p.evaluate(() => { markChanged(); return localStorage.getItem('spendwise_draft') === null; }));
+  // Sample data can't be saved: the menu explains, and nothing downloads
+  const filesBeforeSample = fs.readdirSync(DL).length;
+  await tap('#downloadBtn'); await sleep(150);
+  ok('save menu explains sample data cannot be saved', await vis('#saveSampleHint') &&
+    await p.$eval('#saveExcelItem', el => el.getAttribute('aria-disabled')) === 'true');
+  await p.click('#saveExcelItem'); await sleep(600);
+  ok('saving sample data does nothing but explain', fs.readdirSync(DL).length === filesBeforeSample &&
+    /sample data, so it can't be saved/.test(await text('#statusMessage') || ''));
+  ok('no unsaved badge for sample data', !(await vis('#unsavedBadge')));
+  await tap('#sampleClear'); await sleep(200);
+  ok('clearing sample data returns to the hero', await p.evaluate(() => budgetData.length === 0) && !(await vis('#sampleBanner')) && await vis('#dashEmpty'));
 
   // Open old Excel
   await (await p.$('#uploadFile')).uploadFile(excel); await sleep(700);
@@ -178,7 +199,7 @@ const server = http.createServer((req, res) => {
   // Add entry
   await p.click('#addBtn'); await sleep(80);
   ok('inline error for empty amount', (await text('#amountError')) === 'Enter an amount');
-  await p.click('#entryCard .type-opt[data-type="C"]');
+  await tap('#entryCard .type-opt[data-type="C"]');
   ok('income toggle relabels button', (await text('#addBtnLabel')) === 'Add income');
   await p.keyboard.press('ArrowLeft');
   ok('arrow key switches back to expense', (await text('#addBtnLabel')) === 'Add expense');
@@ -461,6 +482,46 @@ const server = http.createServer((req, res) => {
   ok('large lists draw 300 rows, then 300 more', paged.first === 300 && paged.second === 600, JSON.stringify(paged));
   ok('totals include rows not drawn yet', /650 transactions/.test(paged.footer) && /\$650\.00/.test(paged.footer), paged.footer);
 
+  // Compact filters: a date chip filters, the button counts active filters
+  // (it may already be open: filtering from the dashboard opens it)
+  if (!(await vis('#filterPanel'))) { await tap('#filtersToggle'); await sleep(100); }
+  ok('filters panel opens', await vis('#filterPanel'));
+  await p.click('#filterPanel [data-preset="last-month"]'); await sleep(200);
+  ok('date chip filters and the count shows', await p.evaluate(() => getFilteredData().every(r => r.Date >= filterStartDate.value && r.Date <= filterEndDate.value)) &&
+    (await text('#filterCount')) === '1' && await p.$eval('#filterPanel [data-preset="last-month"]', el => el.classList.contains('active')));
+  await p.click('#clearFilterBtn'); await sleep(150);
+  ok('reset clears the count', !(await vis('#filterCount')));
+
+  // Quick category chips
+  const firstChip = await p.$eval('#quickCats .quick-cat', el => el.dataset.cat);
+  await tap('#quickCats .quick-cat'); await sleep(80);
+  ok('quick category chip sets the category', await p.evaluate(() => document.getElementById('category').value) === firstChip &&
+    (await text('#categoryPickerLabel')) === firstChip);
+  await tap('#quickCats .quick-cat.active'); await sleep(80);
+  ok('tapping it again goes back to Auto-detect', await p.evaluate(() => document.getElementById('category').value) === '');
+
+  // Keyboard shortcuts
+  await p.evaluate(() => document.activeElement && document.activeElement.blur());
+  await p.keyboard.press('/'); await sleep(150);
+  ok('/ focuses search', await p.evaluate(() => document.activeElement === searchInput));
+  await p.evaluate(() => document.activeElement.blur());
+  await p.keyboard.press('n'); await sleep(350);
+  ok('N starts a new transaction', await p.evaluate(() => document.activeElement && document.activeElement.id === 'amount'));
+  await p.evaluate(() => document.activeElement.blur());
+  await p.keyboard.press('?'); await sleep(150);
+  ok('? lists the shortcuts', await vis('#shortcutsModal'));
+  await p.keyboard.press('Escape'); await sleep(100);
+
+  // Settings section menu jumps to a section
+  await menu('openSettingsModal'); await sleep(150);
+  await p.click('.settings-nav [data-target="set-savings-goals"]'); await sleep(700);
+  ok('settings menu jumps to a section', await p.evaluate(() => {
+    const box = document.querySelector('.settings-content').getBoundingClientRect();
+    const sec = document.getElementById('set-savings-goals').getBoundingClientRect();
+    return sec.top >= box.top - 2 && sec.top < box.top + 140;
+  }));
+  await p.keyboard.press('Escape'); await sleep(100);
+
   // Save: one file per month
   const n = await p.evaluate(() => budgetData.length);
   await tap('#downloadBtn'); await sleep(120);
@@ -519,6 +580,11 @@ const server = http.createServer((req, res) => {
   await menu('openCompareModal'); await sleep(150);
   await (await p.$('#compareFilesInput')).uploadFile(excel); await sleep(800);
   ok('compare months summary', await vis('#comparisonSummary'));
+  // Excel and bank-statement PDFs together
+  await (await p.$('#compareFilesInput')).uploadFile(excel, bankPdf, cardPdf);
+  await p.waitForFunction(() => /Compared \d+ month/.test(document.getElementById('statusMessage').textContent), { timeout: 20000 }).catch(() => {});
+  const cmp = await p.evaluate(() => ({ status: document.getElementById('statusMessage').textContent, income: document.getElementById('compareTotalIncome').textContent }));
+  ok('compare reads Excel and PDFs together', /from 3 files/.test(cmp.status) && cmp.income !== '$0.00', JSON.stringify(cmp));
   await p.keyboard.press('Escape');
 
   // Draft restore
@@ -546,8 +612,8 @@ const server = http.createServer((req, res) => {
   // Phone
   await p.setViewport({ width: 390, height: 844, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
   await p.reload({ waitUntil: 'networkidle0' }); await sleep(200); await p.click('#draftRestore'); await sleep(300);
-  ok('phone: + button', await vis('#fab'));
-  await p.click('#fab'); await sleep(350);
+  ok('phone: tab bar with an add button', await vis('#tabBar') && await vis('#tabAdd') && !(await vis('#fab')));
+  await p.click('#tabAdd'); await sleep(350);
   ok('phone: sheet opens', await p.$eval('#entryCard', e => e.classList.contains('sheet-open')));
   await p.type('#amount', '9.99'); await p.type('#store', 'Phone add'); await p.click('#addBtn'); await sleep(300);
   ok('phone: add closes sheet', !(await p.$eval('#entryCard', e => e.classList.contains('sheet-open'))));

@@ -8,7 +8,7 @@
   <!-- Everything is served from this site: no third-party requests, no inline scripts -->
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; worker-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'">
   <meta name="referrer" content="no-referrer">
-  <meta name="theme-color" content="#0D9488">
+  <meta name="theme-color" content="#0F4C3F">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
@@ -17,10 +17,11 @@
   <link rel="icon" href="icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="icon-180.png">
   <link rel="preload" href="vendor/inter/inter-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="vendor/fraunces/fraunces-latin-full-normal.woff2" as="font" type="font/woff2" crossorigin>
   <script src="vendor/xlsx/xlsx.full.min.js"></script>
   <script src="vendor/chartjs/chart.umd.min.js"></script>
   <link rel="stylesheet" href="vendor/fontawesome/css/all.min.css">
-  <link rel="stylesheet" href="styles.css?v=20261103">
+  <link rel="stylesheet" href="styles.css?v=20261104">
 </head>
 <body>
 
@@ -75,24 +76,22 @@
       <div class="kpi"><span class="kpi-label"><i class="fas fa-piggy-bank"></i> Savings rate</span><span class="kpi-value" id="kpiRate">—</span><span class="kpi-delta" id="kpiRateDelta"></span></div>
     </div>
 
-    <div class="welcome" id="dashEmpty" hidden>
-      <div class="welcome-text">
-        <h2>Welcome to Moneta</h2>
-        <p>Track spending, budgets and who paid what. Add a transaction, or upload an Excel file or bank statement.</p>
+    <!-- First screen: the moment a visitor decides to start -->
+    <div class="welcome hero" id="dashEmpty" hidden>
+      <p class="eyebrow reveal-item" style="--i:0">Private household finance</p>
+      <h2 class="hero-title reveal-item" style="--i:1">Your money,<br><em>beautifully</em> in order.</h2>
+      <p class="hero-sub reveal-item" style="--i:2">See where every dollar goes, who paid what and how much you're saving — straight from the Excel files and bank statements you already have.</p>
+      <div class="hero-actions reveal-item" style="--i:3">
+        <button type="button" class="cta-primary" id="welcomeOpen"><i class="fas fa-arrow-up-from-bracket" aria-hidden="true"></i> Upload Excel or bank PDF</button>
+        <button type="button" class="cta-secondary" id="welcomeAdd"><i class="fas fa-plus" aria-hidden="true"></i> Add a transaction</button>
       </div>
-      <div class="welcome-actions">
-        <button type="button" class="welcome-card" id="welcomeAdd">
-          <span class="welcome-icon add"><i class="fas fa-plus"></i></span>
-          <strong>Add a transaction</strong>
-          <span>Type it in — store names complete as you type</span>
-        </button>
-        <button type="button" class="welcome-card" id="welcomeOpen">
-          <span class="welcome-icon excel"><i class="fas fa-upload"></i></span>
-          <strong>Upload a file</strong>
-          <span>Your monthly Excel file or a bank statement PDF — old files work too</span>
-        </button>
-      </div>
-      <p class="welcome-privacy"><i class="fas fa-lock"></i> Files are read on this device — nothing is sent anywhere.</p>
+      <button type="button" class="cta-link reveal-item" style="--i:4" id="welcomeSample">Not ready? Explore with sample data <i class="fas fa-arrow-right" aria-hidden="true"></i></button>
+      <ul class="trust-row reveal-item" style="--i:5" aria-label="Privacy">
+        <li><i class="fas fa-lock" aria-hidden="true"></i> Stays on this device</li>
+        <li><i class="fas fa-building-columns" aria-hidden="true"></i> No bank login</li>
+        <li><i class="fas fa-wifi" aria-hidden="true"></i> Works offline</li>
+        <li><i class="fas fa-ban" aria-hidden="true"></i> No ads</li>
+      </ul>
     </div>
 
     <div class="dash-grid" id="dashCharts">
@@ -145,6 +144,16 @@
     </div>
   </div>
 
+  <!-- Shown while sample data is on screen -->
+  <div class="sample-banner" id="sampleBanner" role="status" hidden>
+    <i class="fas fa-flask" aria-hidden="true"></i>
+    <span>You're exploring <strong>sample data</strong> — nothing here is yours, and nothing is saved.</span>
+    <div class="draft-actions">
+      <button type="button" class="pill-btn primary" id="sampleUpload">Use my own data</button>
+      <button type="button" class="pill-btn ghost" id="sampleClear">Clear sample</button>
+    </div>
+  </div>
+
   <div id="dashboardView" class="view-section active">
     <!-- Add transaction: inline card on desktop, bottom sheet on phones -->
     <div class="sheet-backdrop" id="sheetBackdrop" hidden></div>
@@ -187,6 +196,7 @@
             <i class="fas fa-chevron-down"></i>
           </button>
           <div id="categoryPickerPanel" class="category-picker-panel" hidden></div>
+          <div class="quick-cats" id="quickCats" role="group" aria-label="Quick categories"></div>
         </label>
         <label><div>Purchased By</div>
           <select id="purchasedBy"></select>
@@ -220,6 +230,7 @@
               <i class="fas fa-download"></i> <span>Save</span> <span class="unsaved-badge" id="unsavedBadge" hidden></span> <i class="fas fa-chevron-down caret"></i>
             </button>
             <div class="pop-menu" id="saveMenu" role="menu" hidden>
+              <p class="menu-hint" id="saveSampleHint" hidden><i class="fas fa-flask" aria-hidden="true"></i> Sample data can't be saved — upload your own to save.</p>
               <button type="button" role="menuitem" id="saveExcelItem"><i class="fas fa-file-excel"></i><span><strong>Excel (.xlsx)</strong><em>Keeps your data — open it again later</em></span></button>
               <button type="button" role="menuitem" id="savePdfItem"><i class="fas fa-file-pdf"></i><span><strong>PDF report</strong><em id="savePdfHint">A summary to keep or share</em></span></button>
             </div>
@@ -230,34 +241,57 @@
         <button type="button" class="collapse-btn" data-collapse="table" aria-expanded="true" aria-label="Collapse Transactions"><i class="fas fa-chevron-up"></i></button>
       </div>
 
+      <!-- Search stays in view; everything else lives behind "Filters" -->
       <div class="filter-group">
         <div class="search-box">
           <i class="fas fa-magnifying-glass" aria-hidden="true"></i>
           <input type="search" id="searchInput" placeholder="Search store, person, note, category or amount…" aria-label="Search transactions">
         </div>
-        <select id="datePreset" aria-label="Date range preset">
-          <option value="all" selected>All time</option>
-          <option value="this-month">This month</option>
-          <option value="last-month">Last month</option>
-          <option value="last-3">Last 3 months</option>
-          <option value="this-year">This year</option>
-          <option value="custom">Custom range</option>
-        </select>
-        <div class="range">
-          <input type="date" id="filterStartDate" aria-label="From date">
-          <span>to</span>
-          <input type="date" id="filterEndDate" aria-label="To date">
-        </div>
-        <div class="range">
-          <input type="number" id="filterMinAmount" placeholder="Min $" aria-label="Minimum amount" inputmode="decimal">
-          <span>–</span>
-          <input type="number" id="filterMaxAmount" placeholder="Max $" aria-label="Maximum amount" inputmode="decimal">
-        </div>
+        <button type="button" class="pill-btn ghost" id="filtersToggle" aria-expanded="false" aria-controls="filterPanel">
+          <i class="fas fa-sliders" aria-hidden="true"></i> <span>Filters</span> <span class="filter-count" id="filterCount" hidden></span>
+        </button>
         <span class="filter-chip" id="categoryChip" hidden>
           <i class="fas fa-tag" aria-hidden="true"></i> <span id="categoryChipLabel"></span>
           <button type="button" id="categoryChipClear" aria-label="Remove category filter"><i class="fas fa-times"></i></button>
         </span>
         <button type="button" class="pill-btn ghost" id="clearFilterBtn"><i class="fas fa-filter-circle-xmark"></i> <span>Reset</span></button>
+      </div>
+      <div class="filter-panel" id="filterPanel" hidden>
+        <div class="filter-row">
+          <span class="filter-label">When</span>
+          <div class="preset-chips" role="group" aria-label="Date range">
+            <button type="button" class="chip" data-preset="all">All time</button>
+            <button type="button" class="chip" data-preset="this-month">This month</button>
+            <button type="button" class="chip" data-preset="last-month">Last month</button>
+            <button type="button" class="chip" data-preset="last-3">3 months</button>
+            <button type="button" class="chip" data-preset="this-year">This year</button>
+            <button type="button" class="chip" data-preset="custom">Custom</button>
+          </div>
+          <select id="datePreset" class="sr-select" tabindex="-1" aria-hidden="true">
+            <option value="all" selected>All time</option>
+            <option value="this-month">This month</option>
+            <option value="last-month">Last month</option>
+            <option value="last-3">Last 3 months</option>
+            <option value="this-year">This year</option>
+            <option value="custom">Custom range</option>
+          </select>
+        </div>
+        <div class="filter-row" id="customRange">
+          <span class="filter-label">Dates</span>
+          <div class="range">
+            <input type="date" id="filterStartDate" aria-label="From date">
+            <span>to</span>
+            <input type="date" id="filterEndDate" aria-label="To date">
+          </div>
+        </div>
+        <div class="filter-row">
+          <span class="filter-label">Amount</span>
+          <div class="range">
+            <input type="number" id="filterMinAmount" placeholder="Min $" aria-label="Minimum amount" inputmode="decimal">
+            <span>–</span>
+            <input type="number" id="filterMaxAmount" placeholder="Max $" aria-label="Maximum amount" inputmode="decimal">
+          </div>
+        </div>
       </div>
 
       <div class="bulk-bar" id="bulkBar" hidden>
@@ -293,6 +327,32 @@
   <datalist id="noteSuggestions"></datalist>
 
   <button type="button" class="fab" id="fab" aria-label="Add transaction"><i class="fas fa-plus"></i></button>
+
+  <!-- Phones: jump between the parts of the app -->
+  <nav class="tab-bar" id="tabBar" aria-label="Sections">
+    <button type="button" class="tab" data-tab="overview"><i class="fas fa-gauge-high" aria-hidden="true"></i><span>Overview</span></button>
+    <button type="button" class="tab" data-tab="table"><i class="fas fa-list" aria-hidden="true"></i><span>Activity</span></button>
+    <button type="button" class="tab tab-add" id="tabAdd" aria-label="Add transaction"><i class="fas fa-plus" aria-hidden="true"></i></button>
+    <button type="button" class="tab" data-tab="reports"><i class="fas fa-chart-pie" aria-hidden="true"></i><span>Reports</span></button>
+    <button type="button" class="tab" data-tab="settings"><i class="fas fa-gear" aria-hidden="true"></i><span>Settings</span></button>
+  </nav>
+
+  <!-- Keyboard shortcuts (press ?) -->
+  <div class="modal" id="shortcutsModal" role="dialog" aria-modal="true" aria-labelledby="shortcutsTitle">
+    <div class="modal-content shortcuts-content">
+      <span class="close" id="closeShortcuts" role="button" tabindex="0" aria-label="Close"><i class="fas fa-times"></i></span>
+      <div class="chart-title" id="shortcutsTitle">Keyboard shortcuts</div>
+      <dl class="shortcut-list">
+        <div><dt><kbd>N</kbd></dt><dd>New transaction</dd></div>
+        <div><dt><kbd>/</kbd></dt><dd>Search transactions</dd></div>
+        <div><dt><kbd>S</kbd></dt><dd>Save menu (Excel or PDF)</dd></div>
+        <div><dt><kbd>⌘</kbd> <kbd>S</kbd></dt><dd>Save to Excel right away</dd></div>
+        <div><dt><kbd>Enter</kbd></dt><dd>Add the transaction / save an edit</dd></div>
+        <div><dt><kbd>Esc</kbd></dt><dd>Close a dialog or menu</dd></div>
+        <div><dt><kbd>?</kbd></dt><dd>Show this list</dd></div>
+      </dl>
+    </div>
+  </div>
 
   <!-- Review transactions read from a bank statement PDF -->
   <div class="modal" id="importModal" role="dialog" aria-modal="true" aria-labelledby="importTitle">
@@ -394,6 +454,8 @@
 
   <footer class="app-footer">
     <div class="brand">Moneta<span class="tm">™</span></div>
+    <button type="button" class="shortcuts-link" id="shortcutsLink"><kbd>?</kbd> Keyboard shortcuts</button>
+    <div class="footer-promise"><i class="fas fa-lock" aria-hidden="true"></i> Your numbers never leave this device.</div>
     <div>© <span id="footerYear"></span> Harsha Karuturi · <a href="LICENSE" target="_blank" rel="noopener">MIT License</a></div>
   </footer>
 
@@ -506,7 +568,7 @@
       </div>
       <label class="pill-btn primary file-upload-btn">
         <i class="fas fa-folder-open"></i> <span>Load monthly files</span>
-        <input type="file" id="yearFilesInput" accept=".xlsx,.xls" multiple>
+        <input type="file" id="yearFilesInput" accept=".xlsx,.xls,.pdf,application/pdf" multiple>
       </label>
       <button type="button" class="pill-btn ghost" id="yearUseScreen" hidden>Use on-screen data</button>
     </div>
@@ -531,8 +593,9 @@
     <span class="close" id="closeSettings" role="button" tabindex="0" aria-label="Close"><i class="fas fa-times"></i></span>
     <div class="chart-title" id="settingsTitle">Settings</div>
 
+    <nav class="settings-nav" aria-label="Settings sections"><button type="button" data-target="set-people">People</button><button type="button" data-target="set-banks-cards">Banks &amp; cards</button><button type="button" data-target="set-monthly-budgets">Monthly budgets</button><button type="button" data-target="set-categories">Categories</button><button type="button" data-target="set-custom-categories">Custom categories</button><button type="button" data-target="set-recurring-transactions">Recurring transactions</button><button type="button" data-target="set-savings-goals">Savings goals</button><button type="button" data-target="set-merged-names">Merged names</button><button type="button" data-target="set-currency">Currency</button><button type="button" data-target="set-reset-privacy">Reset</button></nav>
     <div class="settings-grid">
-      <section class="settings-card">
+      <section class="settings-card" id="set-people">
         <h3><i class="fas fa-users"></i> People</h3>
         <div class="settings-add">
           <input type="text" id="newPersonName" placeholder="Add a name" maxlength="40" aria-label="New person name">
@@ -541,7 +604,7 @@
         <div id="peopleList" class="chip-list"></div>
       </section>
 
-      <section class="settings-card">
+      <section class="settings-card" id="set-banks-cards">
         <h3><i class="fas fa-building-columns"></i> Banks &amp; cards</h3>
         <div class="settings-add">
           <input type="text" id="newBankName" placeholder="Add a bank or card" maxlength="40" aria-label="New bank name">
@@ -550,7 +613,7 @@
         <div id="banksList" class="chip-list"></div>
       </section>
 
-      <section class="settings-card wide">
+      <section class="settings-card wide" id="set-monthly-budgets">
         <h3><i class="fas fa-bullseye"></i> Monthly budgets</h3>
         <p class="settings-help">Pick a category, a group (e.g. "Food &amp; Dining"), or any store name.</p>
         <div class="settings-add">
@@ -562,13 +625,13 @@
         <div id="budgetsList" class="settings-list"></div>
       </section>
 
-      <section class="settings-card wide">
+      <section class="settings-card wide" id="set-categories">
         <h3><i class="fas fa-layer-group"></i> Categories</h3>
         <p class="settings-help">Rename a category, change the keywords that find it, or hide ones you never use. Renaming also updates your transactions and budgets.</p>
         <div id="builtinCats" class="cat-edit-list"></div>
       </section>
 
-      <section class="settings-card wide">
+      <section class="settings-card wide" id="set-custom-categories">
         <h3><i class="fas fa-tags"></i> Custom categories</h3>
         <p class="settings-help">Stores containing a keyword are filed under your category automatically.</p>
         <div class="settings-add">
@@ -579,7 +642,7 @@
         <div id="categoriesList" class="settings-list"></div>
       </section>
 
-      <section class="settings-card wide">
+      <section class="settings-card wide" id="set-recurring-transactions">
         <h3><i class="fas fa-calendar-check"></i> Recurring transactions</h3>
         <p class="settings-help">Added for the current month when you press <strong>Recurring</strong>. Day 31 uses the month's last day.</p>
         <div class="recurring-form">
@@ -601,7 +664,7 @@
         </div>
       </section>
 
-      <section class="settings-card wide">
+      <section class="settings-card wide" id="set-savings-goals">
         <h3><i class="fas fa-piggy-bank"></i> Savings goals</h3>
         <p class="settings-help">Something you're saving for, e.g. a trip or an emergency fund. Track it from the Overview.</p>
         <div class="settings-add">
@@ -613,13 +676,13 @@
         <div id="goalsSettingsList" class="settings-list"></div>
       </section>
 
-      <section class="settings-card wide">
+      <section class="settings-card wide" id="set-merged-names">
         <h3><i class="fas fa-link"></i> Merged names</h3>
         <p class="settings-help">Reports count these as one store or source. Your transactions keep their original names.</p>
         <div id="aliasList" class="settings-list"></div>
       </section>
 
-      <section class="settings-card">
+      <section class="settings-card" id="set-currency">
         <h3><i class="fas fa-coins"></i> Currency</h3>
         <select id="currencySelect" aria-label="Currency">
           <option value="dollar">$ — Dollar</option>
@@ -632,7 +695,7 @@
         <p class="settings-help top-gap">Changes how amounts are shown. Nothing is converted.</p>
       </section>
 
-      <section class="settings-card">
+      <section class="settings-card" id="set-reset-privacy">
         <h3><i class="fas fa-shield-halved"></i> Reset &amp; privacy</h3>
         <p class="settings-help">Reset restores default people, banks and categories. Clear removes everything Moneta keeps in this browser — useful on a shared computer. Your Excel files are never touched.</p>
         <div class="settings-buttons">
@@ -649,11 +712,11 @@
   <div class="modal-content compare-content">
     <span class="close" id="closeCompareMonths" role="button" tabindex="0" aria-label="Close"><i class="fas fa-times"></i></span>
     <div class="chart-title" id="compareTitle">Compare months</div>
-    <p class="settings-help center">Pick several monthly Excel files to see them side by side. Nothing is added to your list.</p>
+    <p class="settings-help center">Pick several monthly files — Excel, bank statement PDFs or Moneta PDF reports, mixed as you like — to see them side by side. Nothing is added to your list.</p>
     <div class="compare-pick">
       <label class="pill-btn primary file-upload-btn">
-        <i class="fas fa-file-circle-plus"></i> <span>Choose Excel files</span>
-        <input type="file" id="compareFilesInput" accept=".xlsx,.xls" multiple>
+        <i class="fas fa-file-circle-plus"></i> <span>Choose files (Excel or PDF)</span>
+        <input type="file" id="compareFilesInput" accept=".xlsx,.xls,.pdf,application/pdf" multiple>
       </label>
     </div>
     <div id="comparisonSummary" class="kpi-grid compare-kpis" style="display: none;">
@@ -670,7 +733,7 @@
 <!-- Filled in when a PDF report is requested; only this prints -->
 <div id="printReport" aria-hidden="true"></div>
 
-<script src="app.js?v=20261103"></script>
-<script src="statement-import.js?v=20261103"></script>
+<script src="app.js?v=20261104"></script>
+<script src="statement-import.js?v=20261104"></script>
 </body>
 </html>
