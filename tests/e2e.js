@@ -389,7 +389,33 @@ const server = http.createServer((req, res) => {
   await p.click('#savePdfItem'); await sleep(400);
   const monthReport = await p.$eval('#printReport', el => el.textContent.replace(/\s+/g, ' '));
   ok('monthly PDF report', await p.evaluate(() => window.__printed) && /Report/.test(monthReport) && /All transactions/.test(monthReport) && /Banff trip/.test(monthReport), monthReport.slice(0, 120));
-  await p.evaluate(() => window.dispatchEvent(new Event('afterprint')));
+  // Round trip: render that report to a real PDF, upload it, and every row comes back the same way round
+  {
+    const reportPdf = path.join(TMP, 'moneta-report.pdf');
+    await p.emulateMediaType('print');
+    await p.pdf({ path: reportPdf, format: 'A4', printBackground: true, preferCSSPageSize: true });
+    await p.emulateMediaType('screen');
+    await p.evaluate(() => window.dispatchEvent(new Event('afterprint')));
+    const expected = await p.evaluate(() => budgetData.filter(r => monthKeyOf(r) === reportMonth()).map(r => {
+      const net = toCents(r['Credit [C]']) - toCents(r['Debit [D]']);
+      return [r['Date'], Math.abs(net), net < 0 ? 'D' : 'C', r['Purchased By'] || '', r['Bank Name'] || '', getCategory(r)].join('|');
+    }).sort());
+    await (await p.$('#uploadAny')).uploadFile(reportPdf);
+    await p.waitForFunction(() => document.getElementById('importModal').style.display === 'flex', { timeout: 20000 }).catch(() => {});
+    ok('a Moneta PDF report is recognised', (await text('#importTitle')) === 'Review Moneta report');
+    const parsed = await p.$$eval('#importTable tbody tr', rows => rows.length);
+    ok('report round trip: same number of rows', parsed === expected.length, `${parsed} vs ${expected.length}`);
+    await p.click('#importAll'); await sleep(80);
+    if (!(await p.$eval('#importAll', el => el.checked))) { await p.click('#importAll'); await sleep(80); }
+    const before = await p.evaluate(() => budgetData.length);
+    await p.click('#importConfirm'); await sleep(250);
+    const added = await p.evaluate(n => budgetData.slice(n).map(r => {
+      const net = toCents(r['Credit [C]']) - toCents(r['Debit [D]']);
+      return [r['Date'], Math.abs(net), net < 0 ? 'D' : 'C', r['Purchased By'] || '', r['Bank Name'] || '', getCategory(r)].join('|');
+    }).sort(), before);
+    ok('report round trip: dates, amounts, direction, person, bank and category all match', JSON.stringify(added) === JSON.stringify(expected), JSON.stringify(added.filter(x => !expected.includes(x)).slice(0, 2)));
+    await p.evaluate(n => { budgetData.length = n; renderTable(); }, before);
+  }
 
   // Savings goal
   await menu('openSettingsModal'); await sleep(150);

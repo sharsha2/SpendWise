@@ -47,7 +47,7 @@ function findMoney(text) {
 
 const SKIP_LINE_RE = /\b(opening balance|closing balance|balance forward|previous (statement )?balance|new balance|beginning balance|ending balance|total|sub-?total|minimum payment|payment due|interest rate|credit limit|available credit|amount due|statement balance)\b/i;
 const OPENING_RE = /\b(opening balance|balance forward|previous (statement )?balance|beginning balance)\b/i;
-const CREDIT_HINT_RE = /\b(deposit|payroll|salary|refund|credit|payment received|payment - thank you|payment thank you|interest paid|e-?transfer from|transfer from|reversal|cashback)\b/i;
+const CREDIT_HINT_RE = /\b(deposit|payroll|salary|refund|return|credit|payment received|payment from|payment - thank you|payment thank you|interest paid|e-?transfer from|transfer from|reversal|cashback)\b/i;
 
 function guessBank(text) {
   const t = text.toLowerCase();
@@ -103,8 +103,15 @@ function resolveYear(month, period, fallbackYear) {
  * Each transaction: { date: 'YYYY-MM-DD', description, cents (>0), type: 'D'|'C', check }
  * (`check` marks rows whose direction was guessed and deserve a look).
  */
+const DEBIT_HEAD_RE = /\b(withdrawals?|debits?|paid out|money out|charges|purchases)\b/i;
+const CREDIT_HEAD_RE = /\b(deposits?|credits?|paid in|money in|payments)\b/i;
+
 function parseStatementLines(lines, options = {}) {
-  const text = lines.join('\n');
+  // Rows can be plain text or { text, cells } with positions (from the PDF)
+  const rows = lines.map(r => (typeof r === 'string'
+    ? { text: r.replace(/\s+/g, ' ').trim(), cells: null }
+    : { text: r.text, cells: r.cells }));
+  const text = rows.map(r => r.text).join('\n');
   const period = findPeriod(text);
   const years = (text.match(/\b20\d{2}\b/g) || []).map(Number);
   const fallbackYear = options.year || (years.length ? Math.max(...years) : new Date().getFullYear());
@@ -112,10 +119,24 @@ function parseStatementLines(lines, options = {}) {
   const candidates = [];
   let opening = null;
   let skipped = 0;
+  let columns = null; // { D: x, C: x } when the statement has Withdrawals / Deposits columns
 
-  lines.forEach(raw => {
-    const line = raw.replace(/\s+/g, ' ').trim();
+  const centerOf = (row, index) => {
+    if (!row.cells) return null;
+    const c = row.cells.find(cell => index >= cell.start && index < cell.end);
+    return c ? (c.x + c.right) / 2 : null;
+  };
+
+  rows.forEach(row => {
+    const line = row.text;
     if (!line) return;
+    // A header row naming both columns tells us where withdrawals and deposits sit
+    if (row.cells && DEBIT_HEAD_RE.test(line) && CREDIT_HEAD_RE.test(line) && !matchLeadingDate(line)) {
+      const d = row.cells.find(c => DEBIT_HEAD_RE.test(c.str));
+      const c = row.cells.find(cell => CREDIT_HEAD_RE.test(cell.str));
+      if (d && c && d !== c) columns = { D: (d.x + d.right) / 2, C: (c.x + c.right) / 2 };
+      return;
+    }
     if (OPENING_RE.test(line)) {
       const money = findMoney(line);
       if (money.length && opening === null) {
@@ -130,8 +151,9 @@ function parseStatementLines(lines, options = {}) {
     // Card statements often print a posting date right after the transaction date
     const second = matchLeadingDate(rest);
     if (second) rest = rest.slice(second.length).trim();
+    const offset = line.length - rest.length;
 
-    const money = findMoney(rest);
+    const money = findMoney(rest).map(m => ({ ...m, x: centerOf(row, offset + m.index) }));
     if (!money.length) return;
     const description = rest.slice(0, money[0].index).replace(/\s+/g, ' ').trim();
     if (!description || SKIP_LINE_RE.test(description)) { skipped++; return; }
@@ -145,44 +167,85 @@ function parseStatementLines(lines, options = {}) {
     });
   });
 
-  // Bank account statements print a running balance after the amount
+  const result = (transactions, kind) => ({ transactions, bank: guessBank(text), kind, skipped });
+
+  // 1) Withdrawals / Deposits columns: the column an amount sits in decides
+  if (columns) {
+    const transactions = candidates.map(c => {
+      const placed = c.money.filter(m => m.x !== null);
+      const near = placed.length ? placed.reduce((best, m) =>
+        Math.min(Math.abs(m.x - columns.D), Math.abs(m.x - columns.C)) <
+        Math.min(Math.abs(best.x - columns.D), Math.abs(best.x - columns.C)) ? m : best) : c.money[0];
+      const type = near.x === null ? (near.negative ? 'D' : 'C')
+        : Math.abs(near.x - columns.D) <= Math.abs(near.x - columns.C) ? 'D' : 'C';
+      return { date: c.date, description: c.description, cents: near.cents, type, check: near.x === null };
+    });
+    return result(transactions, 'account');
+  }
+
+  // 2) Bank account statements print a running balance after the amount
   const withBalance = candidates.filter(c => c.money.length >= 2).length;
   const kind = candidates.length && withBalance / candidates.length >= 0.5 ? 'account' : 'card';
 
-  let balance = opening;
-  const transactions = candidates.map(c => {
-    if (kind === 'card') {
-      const amt = c.money[c.money.length - 1];
-      return { date: c.date, description: c.description, cents: amt.cents, type: amt.negative ? 'C' : 'D', check: false };
-    }
-    const hasBalance = c.money.length >= 2;
-    const amt = hasBalance ? c.money[c.money.length - 2] : c.money[0];
-    let type = null;
-    if (hasBalance) {
-      const bal = c.money[c.money.length - 1];
-      const newBalance = bal.negative ? -bal.cents : bal.cents;
-      if (balance !== null) {
-        const delta = newBalance - balance;
-        if (delta === amt.cents) type = 'C';
-        else if (delta === -amt.cents) type = 'D';
+  if (kind === 'account') {
+    const rowsB = candidates.map(c => {
+      const hasBalance = c.money.length >= 2;
+      const amt = hasBalance ? c.money[c.money.length - 2] : c.money[0];
+      const bal = hasBalance ? c.money[c.money.length - 1] : null;
+      return { c, amt, bal: bal ? (bal.negative ? -bal.cents : bal.cents) : null };
+    });
+    // The balance before a row is the row above it (oldest first) or below it
+    // (newest first). Try both and keep the order where the numbers add up.
+    const before = (i, newestFirst) => {
+      const j = newestFirst ? i + 1 : i - 1;
+      if (j < 0 || j >= rowsB.length) return opening;
+      return rowsB[j].bal;
+    };
+    const directions = newestFirst => rowsB.map((r, i) => {
+      const prev = before(i, newestFirst);
+      if (r.bal === null || prev === null) return null;
+      const delta = r.bal - prev;
+      return delta === r.amt.cents ? 'C' : delta === -r.amt.cents ? 'D' : null;
+    });
+    const asc = directions(false);
+    const desc = directions(true);
+    const score = arr => arr.filter(Boolean).length;
+    const dates = candidates.map(c => c.date);
+    const sortedDesc = dates.length > 1 && dates[0] > dates[dates.length - 1];
+    const chosen = score(desc) > score(asc) || (score(desc) === score(asc) && sortedDesc) ? desc : asc;
+    const transactions = rowsB.map((r, i) => {
+      let type = chosen[i];
+      let check = false;
+      if (!type) {
+        type = r.amt.negative ? 'D' : CREDIT_HINT_RE.test(r.c.description) ? 'C' : 'D';
+        check = true;
       }
-      balance = newBalance;
-    } else if (balance !== null) {
-      balance = null; // can't follow the balance through rows that don't print it
-    }
-    let check = false;
-    if (!type) {
-      type = amt.negative ? 'D' : CREDIT_HINT_RE.test(c.description) ? 'C' : 'D';
-      check = true;
-    }
-    return { date: c.date, description: c.description, cents: amt.cents, type, check };
-  });
+      return { date: r.c.date, description: r.c.description, cents: r.amt.cents, type, check };
+    });
+    return result(transactions, 'account');
+  }
 
-  return { transactions, bank: guessBank(text), kind, skipped };
+  // 3) Card statements: most use "negative = payment/credit", some print
+  // purchases as negative instead. Payments and refunds tell us which.
+  const last = c => c.money[c.money.length - 1];
+  const hinted = candidates.filter(c => CREDIT_HINT_RE.test(c.description));
+  const others = candidates.filter(c => !CREDIT_HINT_RE.test(c.description));
+  const share = (list, neg) => (list.length ? list.filter(c => last(c).negative === neg).length / list.length : 0);
+  const negativeMeansDebit = hinted.length
+    ? share(hinted, false) > 0.5 && share(others, true) > 0.5
+    : candidates.length >= 3 && share(candidates, true) > 0.5;
+  const transactions = candidates.map(c => {
+    const amt = last(c);
+    const type = negativeMeansDebit ? (amt.negative ? 'D' : 'C') : (amt.negative ? 'C' : 'D');
+    return { date: c.date, description: c.description, cents: amt.cents, type, check: false };
+  });
+  return result(transactions, 'card');
 }
 
-// Groups pdf.js text items into lines (top to bottom, left to right)
-function itemsToLines(items) {
+// Groups pdf.js text items into rows (top to bottom, left to right). Each row
+// keeps its text plus where every piece sits on the page, so columns can be told
+// apart: { text, cells: [{ start, end, x, right, str }] } (start/end index text).
+function itemsToRows(items) {
   const rows = [];
   items.forEach(it => {
     if (!it.str || !it.str.trim()) return;
@@ -190,24 +253,84 @@ function itemsToLines(items) {
     const y = it.transform[5];
     let row = rows.find(r => Math.abs(r.y - y) <= 2.5);
     if (!row) { row = { y, parts: [] }; rows.push(row); }
-    row.parts.push({ x, str: it.str, width: it.width || 0 });
+    row.parts.push({ x, str: it.str.replace(/\s+/g, ' ').trim(), width: it.width || 0 });
   });
   rows.sort((a, b) => b.y - a.y);
   return rows.map(r => {
     r.parts.sort((a, b) => a.x - b.x);
-    let out = '';
+    let text = '';
     let end = null;
+    const cells = [];
     r.parts.forEach(p => {
-      if (end !== null) out += (p.x - end > 1.5) ? ' ' : '';
-      out += p.str;
+      if (!p.str) return;
+      if (end !== null && p.x - end > 1.5 && !text.endsWith(' ')) text += ' ';
+      cells.push({ start: text.length, end: text.length + p.str.length, x: p.x, right: p.x + p.width, str: p.str });
+      text += p.str;
       end = p.x + p.width;
     });
-    return out.replace(/\s+/g, ' ').trim();
+    return { text, cells };
   });
 }
 
+function itemsToLines(items) {
+  return itemsToRows(items).map(r => r.text);
+}
+
+// ---- Moneta's own PDF report ("All transactions" table) ----
+// Reads every column back, so a report made by Moneta can be imported again.
+const MONETA_COLUMNS = ['Date', 'Description', 'Category', 'Person', 'Bank', 'Note', 'Amount'];
+
+function parseMonetaReport(rows) {
+  const allText = rows.map(r => (typeof r === 'string' ? r : r.text)).join('\n');
+  if (!/^MONETA$/m.test(allText) || !/All transactions/.test(allText)) return null;
+  const transactions = [];
+  let columns = null;
+  rows.forEach(row => {
+    if (typeof row === 'string' || !row.cells) return;
+    const words = row.cells.map(c => c.str);
+    if (MONETA_COLUMNS.every(h => words.includes(h))) {
+      columns = MONETA_COLUMNS.map(h => {
+        const c = row.cells.find(x => x.str === h);
+        return { name: h, x: c.x, right: c.right };
+      });
+      return;
+    }
+    if (!columns) return;
+    const date = matchLeadingDate(row.cells[0] ? row.cells[0].str : '');
+    if (!date || !date.year) return;
+    // Each piece of text belongs to the column whose header starts at or left of it
+    // (Amount is right-aligned, so anything past the Note column is the amount)
+    const fields = Object.fromEntries(MONETA_COLUMNS.map(n => [n, []]));
+    row.cells.forEach(c => {
+      let col = columns[0];
+      columns.forEach(h => { if (c.x >= h.x - 4) col = h; });
+      if (c.right >= columns[6].right - 6 && /\d/.test(c.str)) col = columns[6];
+      fields[col.name].push(c.str);
+    });
+    const amountText = fields.Amount.join('');
+    const money = findMoney(amountText.replace(/^\+/, ''));
+    if (!money.length) return;
+    // The report marks spending with − and income with +; transfers keep their sign too
+    const type = /^[−-]/.test(amountText.trim()) ? 'D' : 'C';
+    const description = fields.Description.filter(w => !/^(transfer|refund)$/i.test(w)).join(' ').trim();
+    if (!validDay(date.year, date.month, date.day)) return;
+    transactions.push({
+      date: `${date.year}-${pad2(date.month)}-${pad2(date.day)}`,
+      description: description.slice(0, 120) || '—',
+      cents: money[0].cents,
+      type,
+      check: false,
+      category: fields.Category.join(' ').trim(),
+      person: fields.Person.join(' ').trim(),
+      bank: fields.Bank.join(' ').trim(),
+      note: fields.Note.join(' ').trim()
+    });
+  });
+  return transactions.length ? { transactions, bank: '', kind: 'moneta', skipped: 0 } : null;
+}
+
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { matchLeadingDate, findMoney, parseStatementLines, guessBank, findPeriod, itemsToLines };
+  module.exports = { matchLeadingDate, findMoney, parseStatementLines, parseMonetaReport, guessBank, findPeriod, itemsToLines, itemsToRows };
 }
 
 /* ---------------- Browser UI ---------------- */
@@ -270,7 +393,7 @@ if (typeof document !== 'undefined') {
         if (onPage) onPage(i, pages);
         const page = await doc.getPage(i);
         const content = await page.getTextContent();
-        lines.push(...itemsToLines(content.items));
+        lines.push(...itemsToRows(content.items));
       }
     } finally {
       await task.destroy();
@@ -292,6 +415,7 @@ if (typeof document !== 'undefined') {
     const rows = [];
     const problems = [];
     let bank = '';
+    let fromReport = false;
     for (const [fi, file] of list.entries()) {
       const label = list.length > 1 ? `📄 Statement ${fi + 1} of ${list.length}` : '📄 Reading statement';
       showProgress(`${label}…`, fi / list.length);
@@ -299,10 +423,12 @@ if (typeof document !== 'undefined') {
         if (file.size > 25 * 1024 * 1024) throw new Error('file is larger than 25 MB');
         const lines = await readPdfLines(file, (page, pages) =>
           showProgress(`${label} — page ${page} of ${pages}`, (fi + page / pages) / list.length));
-        if (lines.join('').replace(/\s/g, '').length < 8) {
+        if (lines.map(l => l.text).join('').replace(/\s/g, '').length < 8) {
           throw new Error('no readable text — it looks like a scanned image');
         }
-        const result = parseStatementLines(lines);
+        // A report made by Moneta is read column by column; anything else is a bank statement
+        const result = parseMonetaReport(lines) || parseStatementLines(lines);
+        if (result.kind === 'moneta') fromReport = true;
         if (!result.transactions.length) throw new Error('no transactions found in a format Moneta recognises');
         bank = bank || result.bank;
         result.transactions.forEach(t => rows.push({ ...t, include: true, file: file.name }));
@@ -318,23 +444,28 @@ if (typeof document !== 'undefined') {
     document.getElementById('statusMessage').style.display = 'none';
     importRows = rows;
     importSourceName = list.length === 1 ? list[0].name : `${list.length} statements`;
-    openImportReview(matchSettingsBank(bank), problems);
+    openImportReview(matchSettingsBank(bank), problems, fromReport);
   }
 
+  // Rows from a Moneta report bring their own person, bank, category and note;
+  // bank statement rows take the person and bank chosen in the dialog
   function buildEntry(r, person, bank) {
     const value = r.cents / 100;
-    return {
+    const entry = {
       'Date': r.date,
-      'Purchased By': person,
+      'Purchased By': r.person || person,
       'Purchased Store': r.description,
-      'Bank Name': bank,
+      'Bank Name': r.bank || bank,
       'Debit [D]': r.type === 'D' ? value : '',
       'Credit [C]': r.type === 'C' ? value : '',
       'Amount Total': value
     };
+    if (r.category) entry['Category'] = r.category;
+    if (r.note) entry['Notes'] = r.note.slice(0, 200);
+    return entry;
   }
 
-  function openImportReview(bank, problems) {
+  function openImportReview(bank, problems, fromReport) {
     const settings = getSettings();
     const bankSel = document.getElementById('importBank');
     const banks = bank && !settings.banks.includes(bank) ? [bank, ...settings.banks] : settings.banks;
@@ -351,6 +482,8 @@ if (typeof document !== 'undefined') {
       r.include = !r.duplicate;
     });
     document.getElementById('importProblems').textContent = problems.length ? `⚠️ Skipped: ${problems.join('; ')}` : '';
+    document.getElementById('importReportNote').hidden = !fromReport;
+    document.getElementById('importTitle').textContent = fromReport ? 'Review Moneta report' : 'Review statement';
     renderImportRows();
     document.getElementById('importModal').style.display = 'flex';
   }
@@ -358,7 +491,7 @@ if (typeof document !== 'undefined') {
   function renderImportRows() {
     const tbody = document.querySelector('#importTable tbody');
     tbody.innerHTML = importRows.map((r, i) => {
-      const cat = getCategory({ 'Purchased Store': r.description });
+      const cat = r.category ? canonicalCategory(r.category) : getCategory({ 'Purchased Store': r.description });
       const kind = classify(buildEntry(r, '', '')).kind;
       const tag = r.duplicate ? '<span class="kind-tag">Already in list</span>'
         : r.check ? '<span class="kind-tag check">Check type</span>'

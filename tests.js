@@ -488,6 +488,55 @@ t('impossible dates and lines without amounts are ignored', () => {
   eq(r.transactions[0].description, 'REAL STORE');
 });
 
+t('newest-first chequing statement: balance still decides direction', () => {
+  const r = stmt.parseStatementLines([
+    'Simplii Financial No Fee Chequing',
+    '2026-10-05 INTERAC E-TRANSFER JOHN 50.25 1,149.75',
+    '2026-10-02 POS PURCHASE IKEA 1,800.00 1,200.00',
+    '2026-10-01 E-TRANSFER FROM EMPLOYER 2,000.00 3,000.00',
+    'Opening balance 1,000.00'
+  ]);
+  eq(r.transactions.map(x => x.type).join(''), 'DDC', 'withdrawals are debits');
+  eq(r.transactions.some(x => x.check), false, 'decided from the balance, not guessed');
+});
+
+t('chequing statement without an opening balance: direction from neighbouring balances', () => {
+  const r = stmt.parseStatementLines([
+    '2026-10-01 MOBILE DEPOSIT 500.00 2,500.00',
+    '2026-10-03 POS PURCHASE 40.00 2,460.00',
+    '2026-10-04 TRANSFER OUT 60.00 2,400.00'
+  ]);
+  eq(r.transactions.slice(1).map(x => x.type).join(''), 'DD');
+});
+
+t('card statement that prints purchases as negative is not flipped', () => {
+  const r = stmt.parseStatementLines([
+    'Wealthsimple Cash card',
+    'Oct 3 UBER EATS -23.45',
+    'Oct 5 COSTCO WHOLESALE -85.20',
+    'Oct 7 PAYMENT RECEIVED THANK YOU 500.00',
+    'Oct 9 NETFLIX.COM -16.99'
+  ]);
+  eq(r.transactions.map(x => x.type).join(''), 'DDCD');
+});
+
+t('separate Withdrawals / Deposits columns decide the direction', () => {
+  const cell = (start, str, x, width) => ({ start, end: start + str.length, x, right: x + width, str });
+  const row = (parts) => {
+    let text = '';
+    const cells = parts.map(([str, x, w]) => { if (text) text += ' '; const c = cell(text.length, str, x, w); text += str; return c; });
+    return { text, cells };
+  };
+  const r = stmt.parseStatementLines([
+    row([['Date', 40, 20], ['Description', 100, 60], ['Withdrawals', 330, 60], ['Deposits', 420, 45]]),
+    row([['Oct 2', 40, 25], ['GROCERY STORE', 100, 80], ['45.10', 360, 28]]),
+    row([['Oct 3', 40, 25], ['REFUND FROM STORE', 100, 90], ['12.00', 437, 28]]),
+    row([['Oct 4', 40, 25], ['PHARMACY', 100, 50], ['30.00', 360, 28]])
+  ], { year: 2026 });
+  eq(r.transactions.map(x => x.type).join(''), 'DCD');
+  eq(r.transactions.some(x => x.check), false);
+});
+
 t('pdf text items are rebuilt into lines in reading order', () => {
   const item = (str, x, y, width) => ({ str, transform: [1, 0, 0, 1, x, y], width });
   const lines = stmt.itemsToLines([

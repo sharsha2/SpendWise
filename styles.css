@@ -3203,3 +3203,4 @@
       .cat-keywords { max-width: 100%; white-space: normal; }
       .cat-edit-row.editing input { flex-basis: 100% !important; }
     }
+#importReportNote i { color: var(--primary-color); }
